@@ -160,6 +160,38 @@ pub unsafe extern "C" fn free_transaction(txn: Handle<ExclusiveTransaction>) {
     txn.drop_handle();
 }
 
+/// Add nullable top-level columns to an existing-table write transaction.
+///
+/// The schema contains only the new columns. The returned transaction writes
+/// the evolved Metadata action and any later AddFile actions in one commit.
+/// This function consumes `txn` on success and error.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid transaction, schema, and engine
+/// handles. The schema visitor and its backing data must remain valid for this
+/// call.
+#[no_mangle]
+pub unsafe extern "C" fn transaction_with_added_columns(
+    txn: Handle<ExclusiveTransaction>,
+    schema: &EngineSchema,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    transaction_with_added_columns_impl(*txn, schema).into_extern_result(&engine)
+}
+
+fn transaction_with_added_columns_impl(
+    txn: Transaction,
+    schema: &EngineSchema,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let mut visitor_state = KernelSchemaVisitorState::default();
+    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+    let fields = extract_kernel_schema(&mut visitor_state, schema_id)?.into_fields();
+    Ok(Box::new(txn.with_added_columns(fields)?).into())
+}
+
 /// Attaches engine info to an existing-table transaction.
 ///
 /// # Safety

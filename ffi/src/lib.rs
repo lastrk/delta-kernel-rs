@@ -1747,6 +1747,30 @@ pub unsafe extern "C" fn visit_metadata_configuration(
             );
         });
 }
+
+/// Visit each effective writer feature for the specified snapshot.
+///
+/// Unlike [`visit_protocol`], this includes features inferred from legacy
+/// writer protocol versions.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid snapshot handle, context pointer,
+/// and visitor function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_enabled_writer_features(
+    snapshot: Handle<SharedSnapshot>,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(engine_context: NullableCvoid, feature: KernelStringSlice),
+) {
+    let snapshot = unsafe { snapshot.as_ref() };
+    for feature in snapshot
+        .table_configuration()
+        .enabled_writer_feature_names()
+    {
+        visitor(engine_context, kernel_string_slice!(feature));
+    }
+}
 // === Protocol handle FFI ===
 
 /// Get the protocol for this snapshot. The returned handle must be freed with [`free_protocol`].

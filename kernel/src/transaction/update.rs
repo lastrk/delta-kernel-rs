@@ -16,6 +16,7 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+use super::schema_evolution::{evolve_table_configuration, SchemaOperation};
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
@@ -124,6 +125,30 @@ impl Transaction {
     pub fn with_blind_append(mut self) -> Self {
         self.is_blind_append = true;
         self
+    }
+
+    /// Add nullable top-level columns to this write transaction.
+    ///
+    /// The evolved metadata and any data-file actions are committed in one
+    /// Delta version. This uses the same validation and column-mapping logic as
+    /// an ALTER TABLE transaction.
+    pub fn with_added_columns(
+        mut self,
+        fields: impl IntoIterator<Item = StructField>,
+    ) -> DeltaResult<Self> {
+        let operations = fields
+            .into_iter()
+            .map(|field| SchemaOperation::AddColumn { field })
+            .collect::<Vec<_>>();
+        if operations.is_empty() {
+            return Err(Error::schema(
+                "Schema evolution requires at least one column to add",
+            ));
+        }
+        self.effective_table_config =
+            evolve_table_configuration(&self.effective_table_config, operations)?;
+        self.should_emit_metadata = true;
+        Ok(self)
     }
 
     /// Set the operation that this transaction is performing. This string will be persisted in the

@@ -2086,7 +2086,7 @@ mod tests {
     fn write_context_reflects_updated_effective_table_config(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (engine, snapshot) = setup_non_dv_table();
-        let mut txn = snapshot
+        let txn = snapshot
             .clone()
             .transaction(Box::new(FileSystemCommitter::new()), &engine)?
             .with_engine_info("default engine");
@@ -2098,23 +2098,11 @@ mod tests {
             .logical_schema()
             .contains("fresh_column"));
 
-        let evolved_schema = schema_ref! {
-            ..(txn.effective_table_config.logical_schema().fields()),
-            nullable "fresh_column": INTEGER,
-        };
-        let evolved_metadata = txn
-            .effective_table_config
-            .metadata()
-            .clone()
-            .with_schema(evolved_schema.clone())?;
-        let evolved_table_config = TableConfiguration::try_new_with_schema(
-            &txn.effective_table_config,
-            evolved_metadata,
-            evolved_schema,
-        )?;
-        txn.replace_effective_table_config(evolved_table_config);
+        let txn =
+            txn.with_added_columns([StructField::nullable("fresh_column", DataType::INTEGER)])?;
 
         let updated_write_context = txn.unpartitioned_write_context()?;
+        assert!(txn.should_emit_metadata);
         assert!(updated_write_context
             .logical_schema()
             .contains("fresh_column"));

@@ -698,6 +698,16 @@ impl TableConfiguration {
         }
     }
 
+    /// Names of all effective writer features, including features inferred
+    /// from a legacy writer protocol version.
+    #[internal_api]
+    pub(crate) fn enabled_writer_feature_names(&self) -> Vec<String> {
+        self.get_enabled_writer_features()
+            .iter()
+            .map(|feature| feature.as_ref().to_owned())
+            .collect()
+    }
+
     /// Returns `Ok` if the kernel supports the given operation on this table. This checks that
     /// the protocol's features are all supported for the requested operation type.
     ///
@@ -966,6 +976,17 @@ mod test {
     };
     use crate::Error;
 
+    #[test]
+    fn effective_writer_features_include_legacy_inferred_features() {
+        let config = MockTableConfigurationBuilder::new()
+            .with_protocol(MockProtocolBuilder::new().with_versions(1, 2).build())
+            .build();
+
+        assert_eq!(
+            config.enabled_writer_feature_names(),
+            ["appendOnly", "invariants"]
+        );
+    }
     #[test]
     fn table_configuration_rejects_partition_column_missing_from_schema() {
         let result = MockTableConfigurationBuilder::new()

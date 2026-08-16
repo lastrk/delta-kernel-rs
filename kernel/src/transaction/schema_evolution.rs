@@ -4,6 +4,7 @@
 //! that validates and applies schema changes to produce an evolved schema.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
@@ -11,10 +12,14 @@ use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    find_max_column_id_in_schema, try_assign_flat_column_mapping_info, validate_column_mapping_id,
-    ColumnMappingMode,
+    find_max_column_id_in_schema, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
+    validate_column_mapping_id, ColumnMappingMode, Operation, TableFeature,
 };
+use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::utils::FoldWithOption as _;
 use crate::DeltaResult;
 
 /// A schema evolution operation to be applied during ALTER TABLE.
@@ -216,6 +221,60 @@ pub(crate) fn apply_schema_operations(
         schema: schema.into(),
         new_max_column_id,
     })
+}
+
+/// Apply validated schema operations to an existing table configuration.
+///
+/// Both metadata-only ALTER transactions and write transactions with schema
+/// evolution use this function. Keeping the operation in one place ensures
+/// that they assign column-mapping metadata and validate protocol features in
+/// the same way.
+pub(crate) fn evolve_table_configuration(
+    table_config: &TableConfiguration,
+    operations: Vec<SchemaOperation>,
+) -> DeltaResult<TableConfiguration> {
+    if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+        return Err(Error::unsupported(
+            "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
+        ));
+    }
+    if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
+        return Err(Error::unsupported(
+            "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
+        ));
+    }
+    table_config.ensure_operation_supported(Operation::Write)?;
+
+    let schema = Arc::unwrap_or_clone(table_config.logical_schema());
+    let column_mapping_mode = table_config.column_mapping_mode();
+    let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+    let current_has_column_mapping_metadata = column_mapping_mode == ColumnMappingMode::None
+        && schema_has_column_mapping_metadata(&schema);
+    let SchemaEvolutionResult {
+        schema: evolved_schema,
+        new_max_column_id,
+    } = apply_schema_operations(
+        schema,
+        operations,
+        column_mapping_mode,
+        current_max_column_id,
+    )?;
+
+    let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
+        strip_stray_column_mapping_metadata(current_has_column_mapping_metadata, &evolved_schema)
+            .map_or(evolved_schema, Arc::new)
+    } else {
+        evolved_schema
+    };
+    let evolved_metadata = table_config
+        .metadata()
+        .clone()
+        .with_schema(evolved_schema.clone())?
+        .fold_with(new_max_column_id, |metadata, id| {
+            metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+        });
+
+    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
 }
 
 #[cfg(test)]
