@@ -641,6 +641,16 @@ impl TableConfiguration {
         }
     }
 
+    /// Names of all effective writer features, including features inferred
+    /// from a legacy writer protocol version.
+    #[internal_api]
+    pub(crate) fn enabled_writer_feature_names(&self) -> Vec<String> {
+        self.get_enabled_writer_features()
+            .iter()
+            .map(|feature| feature.as_ref().to_owned())
+            .collect()
+    }
+
     /// Returns `Ok` if the kernel supports the given operation on this table. This checks that
     /// the protocol's features are all supported for the requested operation type.
     ///
@@ -907,6 +917,20 @@ mod test {
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
         )
+    }
+
+    #[test]
+    fn effective_writer_features_include_legacy_inferred_features() {
+        let schema = schema_ref! { nullable "value": INTEGER };
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        assert_eq!(
+            config.enabled_writer_feature_names(),
+            ["appendOnly", "invariants"]
+        );
     }
 
     fn create_mock_table_config_with_version(
