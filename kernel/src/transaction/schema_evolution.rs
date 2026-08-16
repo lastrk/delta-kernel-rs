@@ -4,6 +4,7 @@
 //! that validates and applies schema changes to produce an evolved schema.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
@@ -11,10 +12,13 @@ use crate::error::Error;
 use crate::expressions::ColumnName;
 use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
     find_max_column_id_in_schema, try_assign_flat_column_mapping_info, validate_column_mapping_id,
-    ColumnMappingMode,
+    validate_schema_column_mapping_strict, ColumnMappingMode, Operation, TableFeature,
 };
+use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
+use crate::utils::FoldWithOption as _;
 use crate::DeltaResult;
 
 /// A schema evolution operation to be applied during ALTER TABLE.
@@ -216,6 +220,54 @@ pub(crate) fn apply_schema_operations(
         schema: schema.into(),
         new_max_column_id,
     })
+}
+
+/// Apply validated schema operations to an existing table configuration.
+///
+/// Both metadata-only ALTER transactions and write transactions with schema
+/// evolution use this function. Keeping the operation in one place ensures
+/// that they assign column-mapping metadata and validate protocol features in
+/// the same way.
+pub(crate) fn evolve_table_configuration(
+    table_config: &TableConfiguration,
+    operations: Vec<SchemaOperation>,
+) -> DeltaResult<TableConfiguration> {
+    // We don't support schema evolution on tables with icebergCompatV3 enabled yet. See
+    // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
+    if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
+        return Err(Error::unsupported(
+            "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
+        ));
+    }
+    // Rejects writes to tables kernel can't safely commit to: writer version out of
+    // kernel's supported range, unsupported writer features, or schemas with SQL-expression
+    // invariants. Runs on the pre-evolution configuration; future schema operations that change
+    // the protocol must also re-check this on the evolved `TableConfiguration`.
+    table_config.ensure_operation_supported(Operation::Write)?;
+
+    let schema = Arc::unwrap_or_clone(table_config.logical_schema());
+    let column_mapping_mode = table_config.column_mapping_mode();
+    let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+    let SchemaEvolutionResult {
+        schema: evolved_schema,
+        new_max_column_id,
+    } = apply_schema_operations(
+        schema,
+        operations,
+        column_mapping_mode,
+        current_max_column_id,
+    )?;
+
+    validate_schema_column_mapping_strict(&evolved_schema, column_mapping_mode)?;
+    let evolved_metadata = table_config
+        .metadata()
+        .clone()
+        .with_schema(evolved_schema.clone())?
+        .fold_with(new_max_column_id, |metadata, id| {
+            metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
+        });
+
+    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
 }
 
 #[cfg(test)]
