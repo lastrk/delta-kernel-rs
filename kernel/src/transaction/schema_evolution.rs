@@ -233,16 +233,23 @@ pub(crate) fn evolve_table_configuration(
     table_config: &TableConfiguration,
     operations: Vec<SchemaOperation>,
 ) -> DeltaResult<TableConfiguration> {
+    // We don't support schema evolution on tables with icebergCompatV3 enabled yet. See
+    // [`crate::table_features::ICEBERG_COMPAT_V3_INFO`] for the tracking issue.
     if table_config.is_feature_enabled(&TableFeature::IcebergCompatV3) {
         return Err(Error::unsupported(
             "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
         ));
     }
+    // TODO(#2630): Support schema evolution on tables with column defaults.
     if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
         return Err(Error::unsupported(
             "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
         ));
     }
+    // Rejects writes to tables kernel can't safely commit to: writer version out of
+    // kernel's supported range, unsupported writer features, or schemas with SQL-expression
+    // invariants. Runs on the pre-evolution configuration; future schema operations that change
+    // the protocol must also re-check this on the evolved `TableConfiguration`.
     table_config.ensure_operation_supported(Operation::Write)?;
 
     let schema = Arc::unwrap_or_clone(table_config.logical_schema());
