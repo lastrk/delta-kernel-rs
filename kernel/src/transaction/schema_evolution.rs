@@ -97,6 +97,37 @@ pub(crate) struct SchemaEvolutionResult {
     pub new_max_column_id: Option<i64>,
 }
 
+fn find_field_metadata_path(field: &StructField, key: &str) -> Option<String> {
+    fn find_in_type(data_type: &DataType, path: &str, key: &str) -> Option<String> {
+        match data_type {
+            DataType::Struct(fields) | DataType::Variant(fields) => {
+                for field in fields.fields() {
+                    let nested = format!("{path}.{}", field.name());
+                    if field.metadata.contains_key(key) {
+                        return Some(nested);
+                    }
+                    if let Some(path) = find_in_type(field.data_type(), &nested, key) {
+                        return Some(path);
+                    }
+                }
+                None
+            }
+            DataType::Array(array) => {
+                find_in_type(array.element_type(), &format!("{path}.element"), key)
+            }
+            DataType::Map(map) => find_in_type(map.key_type(), &format!("{path}.key"), key)
+                .or_else(|| find_in_type(map.value_type(), &format!("{path}.value"), key)),
+            DataType::Primitive(_) => None,
+        }
+    }
+
+    if field.metadata.contains_key(key) {
+        Some(field.name().clone())
+    } else {
+        find_in_type(field.data_type(), field.name(), key)
+    }
+}
+
 /// Applies a sequence of schema operations to the given schema, returning a
 /// [`SchemaEvolutionResult`] (see the struct's docs for details).
 ///
@@ -173,6 +204,20 @@ pub(crate) fn apply_schema_operations(
                         field.name()
                     )));
                 }
+                for (key, reason) in [
+                    ("EXISTS_DEFAULT", "Spark's internal existing-default marker"),
+                    ("delta.typeChanges", "physical type-change history"),
+                    (
+                        "delta.isInternalColumn",
+                        "a Delta Kernel internal-column marker",
+                    ),
+                ] {
+                    if let Some(path) = find_field_metadata_path(&field, key) {
+                        return Err(Error::unsupported(format!(
+                            "Cannot add column '{path}' with `{key}` metadata: an additive schema-evolution operation cannot introduce {reason}"
+                        )));
+                    }
+                }
                 let field = if cm_enabled {
                     let id = max_id.as_mut().ok_or_else(|| {
                         Error::invalid_protocol(
@@ -248,8 +293,8 @@ pub(crate) fn evolve_table_configuration(
     }
     // Rejects writes to tables kernel can't safely commit to: writer version out of
     // kernel's supported range, unsupported writer features, or schemas with SQL-expression
-    // invariants. Runs on the pre-evolution configuration; future schema operations that change
-    // the protocol must also re-check this on the evolved `TableConfiguration`.
+    // invariants. The evolved configuration is checked again below after schema-dependent
+    // protocol requirements have been validated.
     table_config.ensure_operation_supported(Operation::Write)?;
 
     let schema = Arc::unwrap_or_clone(table_config.logical_schema());
@@ -281,7 +326,10 @@ pub(crate) fn evolve_table_configuration(
             metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
         });
 
-    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
+    let evolved =
+        TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)?;
+    evolved.ensure_operation_supported(Operation::Write)?;
+    Ok(evolved)
 }
 
 #[cfg(test)]
@@ -444,6 +492,58 @@ mod tests {
         let err = apply_schema_operations(simple_schema(), ops, ColumnMappingMode::None, None)
             .unwrap_err();
         assert!(err.to_string().contains(error_contains));
+    }
+
+    #[test]
+    fn add_column_preserves_nested_current_default_metadata() {
+        let nested = StructField::nullable("code", DataType::STRING).add_metadata([(
+            ColumnMetadataKey::CurrentDefault.as_ref(),
+            MetadataValue::String("'unknown'".to_owned()),
+        )]);
+        let field = StructField::nullable(
+            "payload",
+            StructType::try_new([nested]).expect("nested schema is valid"),
+        );
+
+        let result = apply_schema_operations(
+            simple_schema(),
+            vec![SchemaOperation::AddColumn { field }],
+            ColumnMappingMode::None,
+            None,
+        )
+        .expect("orphan current-default metadata is inert without the table feature");
+
+        assert_eq!(
+            result
+                .schema
+                .field_at_path(&column_name!("payload", "code"))
+                .get_config_value(&ColumnMetadataKey::CurrentDefault),
+            Some(&MetadataValue::String("'unknown'".to_owned()))
+        );
+    }
+
+    #[rstest]
+    #[case::exists_default("EXISTS_DEFAULT")]
+    #[case::type_changes("delta.typeChanges")]
+    #[case::internal_column("delta.isInternalColumn")]
+    fn add_column_rejects_internal_or_historical_metadata(#[case] key: &str) {
+        let nested = StructField::nullable("code", DataType::STRING)
+            .add_metadata([(key, MetadataValue::String("forged".to_owned()))]);
+        let field = StructField::nullable(
+            "payload",
+            StructType::try_new([nested]).expect("nested schema is valid"),
+        );
+
+        let error = apply_schema_operations(
+            simple_schema(),
+            vec![SchemaOperation::AddColumn { field }],
+            ColumnMappingMode::None,
+            None,
+        )
+        .expect_err("ADD COLUMN cannot introduce internal or historical metadata");
+
+        assert!(error.to_string().contains("payload.code"));
+        assert!(error.to_string().contains(key));
     }
 
     #[rstest]

@@ -159,7 +159,7 @@ mod tests {
         let error_ptr = allocate_err(
             KernelError::GenericError,
             KernelStringSlice {
-                ptr: message.as_ptr() as *const i8,
+                ptr: message.as_ptr() as *const _,
                 len: message.len(),
             },
         );
