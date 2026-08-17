@@ -25,7 +25,9 @@ use crate::scan::data_skipping::stats_schema::{
 use crate::schema::validate_column_defaults_metadata;
 pub(crate) use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::void_utils::strip_void_from_schema;
-use crate::schema::{schema_has_invariants, SchemaRef, StructField, StructType};
+use crate::schema::{
+    schema_has_invariants, ColumnMetadataKey, DataType, SchemaRef, StructField, StructType,
+};
 use crate::table_features::{
     check_reader_version_range, column_mapping_mode, extract_enabled_reader_features,
     get_any_level_column_physical_name, validate_iceberg_compat_if_needed,
@@ -71,6 +73,87 @@ fn strip_metadata(schema: SchemaRef) -> SchemaRef {
         Cow::Owned(s) => Arc::new(s),
         _ => schema,
     }
+}
+
+fn find_field_metadata_path(schema: &StructType, key: &str) -> Option<String> {
+    fn find_in_type(data_type: &DataType, path: &str, key: &str) -> Option<String> {
+        match data_type {
+            DataType::Struct(fields) | DataType::Variant(fields) => {
+                find_in_struct(fields, path, key)
+            }
+            DataType::Array(array) => {
+                find_in_type(array.element_type(), &format!("{path}.element"), key)
+            }
+            DataType::Map(map) => find_in_type(map.key_type(), &format!("{path}.key"), key)
+                .or_else(|| find_in_type(map.value_type(), &format!("{path}.value"), key)),
+            DataType::Primitive(_) => None,
+        }
+    }
+
+    fn find_in_struct(schema: &StructType, prefix: &str, key: &str) -> Option<String> {
+        for field in schema.fields() {
+            let path = if prefix.is_empty() {
+                field.name().clone()
+            } else {
+                format!("{prefix}.{}", field.name())
+            };
+            if field.metadata.contains_key(key) {
+                return Some(path);
+            }
+            if let Some(path) = find_in_type(field.data_type(), &path, key) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    find_in_struct(schema, "", key)
+}
+
+fn validate_schema_metadata_feature_support(table_config: &TableConfiguration) -> DeltaResult<()> {
+    let schema = table_config.logical_schema();
+    let requirements = [
+        (
+            ColumnMetadataKey::GenerationExpression.as_ref(),
+            TableFeature::GeneratedColumns,
+        ),
+        (
+            ColumnMetadataKey::IdentityStart.as_ref(),
+            TableFeature::IdentityColumns,
+        ),
+        (
+            ColumnMetadataKey::IdentityStep.as_ref(),
+            TableFeature::IdentityColumns,
+        ),
+        (
+            ColumnMetadataKey::IdentityHighWaterMark.as_ref(),
+            TableFeature::IdentityColumns,
+        ),
+        (
+            ColumnMetadataKey::IdentityAllowExplicitInsert.as_ref(),
+            TableFeature::IdentityColumns,
+        ),
+    ];
+    for (metadata_key, feature) in requirements {
+        if let Some(path) = find_field_metadata_path(schema.as_ref(), metadata_key) {
+            if !table_config.is_feature_supported(&feature) {
+                return Err(Error::unsupported(format!(
+                    "Column '{path}' uses `{metadata_key}` metadata but the table protocol does not support the required '{}' feature",
+                    feature.as_ref(),
+                )));
+            }
+        }
+    }
+    if let Some(path) = find_field_metadata_path(schema.as_ref(), "delta.typeChanges") {
+        let has_type_widening = table_config.is_feature_supported(&TableFeature::TypeWidening)
+            || table_config.is_feature_supported(&TableFeature::TypeWideningPreview);
+        if !has_type_widening {
+            return Err(Error::unsupported(format!(
+                "Column '{path}' uses `delta.typeChanges` metadata but the table protocol does not support a type-widening feature"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_partition_columns(metadata: &Metadata, logical_schema: &StructType) -> DeltaResult<()> {
@@ -219,6 +302,7 @@ impl TableConfiguration {
         // Validate schema against protocol features now that we have a TC instance.
         validate_timestamp_ntz_feature_support(&table_config)?;
         validate_variant_type_feature_support(&table_config)?;
+        validate_schema_metadata_feature_support(&table_config)?;
         // Reject corrupt column-default metadata (a non-string `CURRENT_DEFAULT`, or a non-`NULL`
         // default on a Variant column).
         #[cfg(feature = "column-defaults-in-dev")]
@@ -889,7 +973,10 @@ mod test {
 
     use super::{InCommitTimestampEnablement, TableConfiguration};
     use crate::actions::{Metadata, Protocol, MIN_VALUES};
-    use crate::schema::{schema_ref, ColumnName, DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{
+        schema_ref, ColumnMetadataKey, ColumnName, DataType, MetadataValue, SchemaRef, StructField,
+        StructType,
+    };
     use crate::table_features::{
         ColumnMappingMode, FeatureType, Operation, TableFeature, TABLE_FEATURES_MIN_READER_VERSION,
         TABLE_FEATURES_MIN_WRITER_VERSION,
@@ -1452,6 +1539,87 @@ mod test {
             result.is_ok(),
             "Should succeed when TIMESTAMP_NTZ is used with required features"
         );
+    }
+
+    #[test]
+    fn schema_metadata_requires_generated_columns_protocol_feature() {
+        let field = StructField::nullable("generated", DataType::INTEGER).add_metadata([(
+            ColumnMetadataKey::GenerationExpression.as_ref(),
+            MetadataValue::String("id + 1".to_owned()),
+        )]);
+        let schema = Arc::new(StructType::try_new([field]).unwrap());
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+
+        assert_result_error_with_message(
+            TableConfiguration::try_new(metadata, protocol, Url::try_from("file:///").unwrap(), 0),
+            "required 'generatedColumns' feature",
+        );
+    }
+
+    #[test]
+    fn schema_metadata_requires_identity_columns_protocol_feature() {
+        for key in [
+            ColumnMetadataKey::IdentityStart,
+            ColumnMetadataKey::IdentityStep,
+            ColumnMetadataKey::IdentityHighWaterMark,
+            ColumnMetadataKey::IdentityAllowExplicitInsert,
+        ] {
+            let field = StructField::nullable("identity", DataType::LONG)
+                .add_metadata([(key.as_ref(), MetadataValue::Number(1))]);
+            let schema = Arc::new(StructType::try_new([field]).unwrap());
+            let metadata =
+                Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+            let protocol =
+                Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST)
+                    .unwrap();
+
+            assert_result_error_with_message(
+                TableConfiguration::try_new(
+                    metadata,
+                    protocol,
+                    Url::try_from("file:///").unwrap(),
+                    0,
+                ),
+                "required 'identityColumns' feature",
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::stable(TableFeature::TypeWidening)]
+    #[case::preview(TableFeature::TypeWideningPreview)]
+    fn type_changes_metadata_requires_a_type_widening_protocol_feature(
+        #[case] feature: TableFeature,
+    ) {
+        let field = StructField::nullable("changed", DataType::LONG).add_metadata([(
+            "delta.typeChanges",
+            MetadataValue::Other(serde_json::json!([])),
+        )]);
+        let schema = Arc::new(StructType::try_new([field]).unwrap());
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let unsupported_protocol =
+            Protocol::try_new_modern(TableFeature::EMPTY_LIST, TableFeature::EMPTY_LIST).unwrap();
+
+        assert_result_error_with_message(
+            TableConfiguration::try_new(
+                metadata.clone(),
+                unsupported_protocol,
+                Url::try_from("file:///").unwrap(),
+                0,
+            ),
+            "type-widening feature",
+        );
+
+        let supported_protocol = Protocol::try_new_modern([feature.clone()], [feature]).unwrap();
+        TableConfiguration::try_new(
+            metadata,
+            supported_protocol,
+            Url::try_from("file:///").unwrap(),
+            0,
+        )
+        .expect("typeChanges is valid with a stable or preview type-widening feature");
     }
 
     #[test]

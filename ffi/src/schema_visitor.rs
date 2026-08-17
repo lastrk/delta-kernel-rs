@@ -570,12 +570,7 @@ mod tests {
         panic!(
             "Error allocator called with type {:?}, message: {:?}",
             etype,
-            unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    msg.ptr as *const u8,
-                    msg.len,
-                ))
-            }
+            unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg.ptr, msg.len,)) }
         );
     }
 
@@ -1310,10 +1305,7 @@ mod tests {
             msg: crate::KernelStringSlice,
         ) -> *mut EngineError {
             let msg = unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    msg.ptr as *const u8,
-                    msg.len,
-                ))
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg.ptr, msg.len))
             };
             assert_eq!(
                 msg,

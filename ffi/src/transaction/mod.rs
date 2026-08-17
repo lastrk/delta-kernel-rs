@@ -13,6 +13,7 @@ pub use deletion_vector::{
 };
 use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::engine_data::FilteredEngineData;
+use delta_kernel::schema::StructType;
 use delta_kernel::transaction::create_table::{
     CreateTableTransaction, CreateTableTransactionBuilder,
 };
@@ -182,6 +183,33 @@ pub unsafe extern "C" fn transaction_with_added_columns(
     transaction_with_added_columns_impl(*txn, schema).into_extern_result(&engine)
 }
 
+/// Add nullable top-level columns, including arbitrary Delta field metadata, to an existing-table
+/// write transaction.
+///
+/// `metadata_schema_json` is a complete Delta JSON struct schema for the same columns supplied by
+/// `schema`. The kernel verifies that names, types, and nullability match before it uses the JSON
+/// schema. This keeps the engine's logical write schema and the committed Delta schema in sync.
+/// The returned transaction writes the evolved Metadata action and any later AddFile actions in
+/// one commit. This function consumes `txn` on success and error.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid transaction, schema, string, and engine handles. The
+/// schema visitor and its backing data must remain valid for this call.
+#[no_mangle]
+pub unsafe extern "C" fn transaction_with_added_columns_and_metadata(
+    txn: Handle<ExclusiveTransaction>,
+    schema: &EngineSchema,
+    metadata_schema_json: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    let metadata_schema_json = unsafe { TryFromStringSlice::try_from_slice(&metadata_schema_json) };
+    transaction_with_added_columns_and_metadata_impl(*txn, schema, metadata_schema_json)
+        .into_extern_result(&engine)
+}
+
 fn transaction_with_added_columns_impl(
     txn: Transaction,
     schema: &EngineSchema,
@@ -190,6 +218,63 @@ fn transaction_with_added_columns_impl(
     let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
     let fields = extract_kernel_schema(&mut visitor_state, schema_id)?.into_fields();
     Ok(Box::new(txn.with_added_columns(fields)?).into())
+}
+
+fn transaction_with_added_columns_and_metadata_impl(
+    txn: Transaction,
+    schema: &EngineSchema,
+    metadata_schema_json: DeltaResult<&str>,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let mut visitor_state = KernelSchemaVisitorState::default();
+    let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+    let engine_schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
+    let metadata_schema: StructType =
+        serde_json::from_str(metadata_schema_json?).map_err(|error| {
+            delta_kernel::Error::schema(format!(
+                "Invalid Delta schema-evolution metadata JSON: {error}"
+            ))
+        })?;
+
+    if schema_shape(&engine_schema)? != schema_shape(&metadata_schema)? {
+        return Err(delta_kernel::Error::schema(
+            "Delta schema-evolution metadata does not match the engine schema",
+        ));
+    }
+
+    Ok(Box::new(txn.with_added_columns(metadata_schema.into_fields())?).into())
+}
+
+/// Convert a schema to its protocol JSON shape with every field-metadata object cleared.
+///
+/// The comparison protects the engine from committing a schema whose names, types, or nullability
+/// differ from the columns that its writer will use. Metadata values themselves remain arbitrary
+/// valid JSON and do not participate in this shape check.
+fn schema_shape(schema: &StructType) -> DeltaResult<serde_json::Value> {
+    fn clear_field_metadata(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    if key == "metadata" {
+                        *value = serde_json::Value::Object(Default::default());
+                    } else {
+                        clear_field_metadata(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    clear_field_metadata(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut shape = serde_json::to_value(schema).map_err(|error| {
+        delta_kernel::Error::schema(format!("Failed to serialize Delta schema: {error}"))
+    })?;
+    clear_field_metadata(&mut shape);
+    Ok(shape)
 }
 
 /// Attaches engine info to an existing-table transaction.
@@ -861,6 +946,31 @@ mod tests {
     };
 
     const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+    #[test]
+    fn schema_shape_ignores_recursive_metadata_but_not_type_changes() {
+        let plain: StructType = serde_json::from_str(
+            r#"{"type":"struct","fields":[{"name":"payload","type":{"type":"struct","fields":[{"name":"code","type":"string","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#,
+        )
+        .unwrap();
+        let annotated: StructType = serde_json::from_str(
+            r#"{"type":"struct","fields":[{"name":"payload","type":{"type":"struct","fields":[{"name":"code","type":"string","nullable":true,"metadata":{"comment":"nested"}}]},"nullable":true,"metadata":{"owner":{"team":"risk"}}}]}"#,
+        )
+        .unwrap();
+        let changed: StructType = serde_json::from_str(
+            r#"{"type":"struct","fields":[{"name":"payload","type":{"type":"struct","fields":[{"name":"code","type":"long","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            schema_shape(&plain).unwrap(),
+            schema_shape(&annotated).unwrap()
+        );
+        assert_ne!(
+            schema_shape(&plain).unwrap(),
+            schema_shape(&changed).unwrap()
+        );
+    }
 
     type LocalTestTables = Vec<(
         Url,
