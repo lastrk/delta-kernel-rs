@@ -5,6 +5,7 @@ use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::schema::schema_ref;
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::CommitResult;
 use delta_kernel::{Engine, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::DefaultEngine;
@@ -186,16 +187,19 @@ async fn test_insert_without_publish_hits_limit() -> Result<(), TestError> {
     }
     assert_eq!(snapshot.version(), max);
 
-    // Next insert should fail with MaxUnpublishedCommitsExceeded
+    // The committer rejects the next insert with MaxUnpublishedCommitsExceeded. The durable
+    // outcome API must classify all errors after the committer call as retryable so that callers
+    // reconcile table state before cleanup or retry.
     let committer = Box::new(uc_committer(&update_table_client));
-    let err = snapshot
+    let outcome = snapshot
         .clone()
         .transaction(committer, &engine)?
-        .commit(&engine)
-        .unwrap_err();
-    assert!(
-        matches!(err, delta_kernel::Error::Generic(msg) if msg.contains("Max unpublished commits"))
-    );
+        .commit(&engine)?;
+    assert!(matches!(
+        outcome,
+        CommitResult::RetryableTransaction(retryable)
+            if retryable.error.to_string().contains("Max unpublished commits")
+    ));
     Ok(())
 }
 

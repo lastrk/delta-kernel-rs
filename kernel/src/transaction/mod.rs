@@ -327,9 +327,9 @@ where
 impl<S> Transaction<S> {
     /// Consume the transaction and commit it to the table. The result is a result of
     /// [CommitResult] with the following semantics:
-    /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
-    ///   transaction in case of a conflict so the user can retry, etc.)
-    /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
+    /// - `Ok(CommitResult)` for success, conflict, or an error returned after the committer was
+    ///   called. The last category can have an indeterminate durable effect.
+    /// - `Err(Error)` indicates that validation failed before the committer was called.
     #[instrument(
         parent = &self.span,
         name = TRANSACTION_COMMIT_SPAN,
@@ -503,13 +503,30 @@ impl<S> Transaction<S> {
             .chain(remove_actions)
             .chain(dv_update_actions);
 
+        // Compute every fallible statistic and CRC input before the committer. After the
+        // committer reports success, the Delta log entry is durable and these computations must
+        // not change the commit result to an error.
+        let bin_boundaries = self
+            .read_snapshot_opt
+            .as_ref()
+            .and_then(|snap| snap.get_file_stats_if_present())
+            .and_then(|s| s.file_size_histogram)
+            .map(|h| h.sorted_bin_boundaries);
+        let file_stats = FileStatsDelta::try_compute_for_txn(
+            &self.add_files_metadata,
+            &self.remove_files_metadata,
+            bin_boundaries.as_deref(),
+        )?;
+        let crc_delta =
+            self.build_crc_delta(file_stats.clone(), in_commit_timestamp, dm_changes.clone())?;
+
         // Step 7: Commit via the committer
         let commit_metadata = self.create_commit_metadata(
             commit_version,
             in_commit_timestamp,
             protocol,
             metadata,
-            dm_changes.clone(),
+            dm_changes,
         )?;
         let prepare_duration = commit_start.elapsed();
         let committer_start = Instant::now();
@@ -519,29 +536,16 @@ impl<S> Transaction<S> {
         let committer_duration = committer_start.elapsed();
         match commit_response {
             Ok(CommitResponse::Committed { file_meta }) => {
-                // TODO(#2717): the commit already succeeded atomically; the post-commit `?`
-                //              below must not fail the txn (and must not mislabel the metric).
-                let bin_boundaries = self
-                    .read_snapshot_opt
-                    .as_ref()
-                    .and_then(|snap| snap.get_file_stats_if_present())
-                    .and_then(|s| s.file_size_histogram)
-                    .map(|h| h.sorted_bin_boundaries);
-                let file_stats = FileStatsDelta::try_compute_for_txn(
-                    &self.add_files_metadata,
-                    &self.remove_files_metadata,
-                    bin_boundaries.as_deref(),
-                )?;
                 self.record_commit_success_metrics(
                     &file_stats,
                     prepare_duration,
                     committer_duration,
                 );
-                let crc_delta =
-                    self.build_crc_delta(file_stats, in_commit_timestamp, dm_changes)?;
-                Ok(CommitResult::CommittedTransaction(
-                    self.into_committed(file_meta, crc_delta)?,
-                ))
+                Ok(CommitResult::CommittedTransaction(self.into_committed(
+                    commit_version,
+                    file_meta,
+                    crc_delta,
+                )))
             }
             Ok(CommitResponse::Conflict { version }) => {
                 // Flips the metric event from success -> failure.
@@ -551,15 +555,17 @@ impl<S> Transaction<S> {
                     self.into_conflicted(version),
                 ))
             }
-            // TODO: we may want to be more or less selective about what is retryable (this is tied
-            // to the idea of "what kind of Errors should write_json_file return?")
-            Err(e @ Error::IOError(_)) => {
-                // Flips the metric event from success -> failure.
-                tracing::Span::current()
-                    .record("failure_reason", CommitFailureReason::RetryableIo.as_ref());
+            // Once the committer is called, an untyped error cannot prove that the atomic create
+            // had no effect. Preserve the transaction as retryable/indeterminate for the caller.
+            Err(e) => {
+                let reason = if matches!(e, Error::IOError(_)) {
+                    CommitFailureReason::RetryableIo
+                } else {
+                    CommitFailureReason::Error
+                };
+                tracing::Span::current().record("failure_reason", reason.as_ref());
                 Ok(CommitResult::RetryableTransaction(self.into_retryable(e)))
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -1342,55 +1348,59 @@ impl<S> Transaction<S> {
 
     fn into_committed(
         self,
+        commit_version: Version,
         file_meta: FileMeta,
         crc_delta: CrcDelta,
-    ) -> DeltaResult<CommittedTransaction> {
-        let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
-
-        let commit_version = parsed_commit.version;
-
-        let (post_commit_stats, post_commit_snapshot) = match &self.read_snapshot_opt {
+    ) -> CommittedTransaction {
+        let post_commit_stats = match &self.read_snapshot_opt {
             Some(snap) => {
                 // Existing table path: use the read snapshot to compute post-commit state.
-                let stats = PostCommitStats {
+                PostCommitStats {
                     commits_since_checkpoint: snap.log_segment().commits_since_checkpoint() + 1,
                     commits_since_log_compaction: snap
                         .log_segment()
                         .commits_since_log_compaction_or_checkpoint()
                         + 1,
-                };
-                let snapshot = snap.new_post_commit(parsed_commit, crc_delta)?;
-                (stats, Arc::new(snapshot))
+                }
             }
-            None => {
-                // CREATE TABLE path: build a fresh Snapshot at version 0.
-                let log_root = self
-                    .effective_table_config
-                    .table_root()
-                    .join("_delta_log/")?;
-                let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
-                let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
-                    Error::internal_error("CREATE TABLE CRC delta is missing protocol or metadata")
-                })?;
-                let stats = PostCommitStats {
-                    commits_since_checkpoint: 1,
-                    commits_since_log_compaction: 1,
-                };
-                let snapshot = Snapshot::new_with_crc(
-                    log_segment,
-                    self.effective_table_config,
-                    Some(Arc::new(crc)),
-                    true, /* built_as_latest */
-                )?;
-                (stats, Arc::new(snapshot))
-            }
+            None => PostCommitStats {
+                commits_since_checkpoint: 1,
+                commits_since_log_compaction: 1,
+            },
         };
 
-        Ok(CommittedTransaction {
+        // Snapshot construction is an optimization after the durable commit. Keep success even
+        // when parsing or rebuilding that optional snapshot fails.
+        let post_commit_snapshot = ParsedLogPath::parse_commit(file_meta)
+            .and_then(|parsed_commit| match &self.read_snapshot_opt {
+                Some(snap) => snap.new_post_commit(parsed_commit, crc_delta),
+                None => {
+                    let log_root = self
+                        .effective_table_config
+                        .table_root()
+                        .join("_delta_log/")?;
+                    let log_segment = LogSegment::new_for_version_zero(log_root, parsed_commit)?;
+                    let crc = crc_delta.into_complete_crc(0).ok_or_else(|| {
+                        Error::internal_error(
+                            "CREATE TABLE CRC delta is missing protocol or metadata",
+                        )
+                    })?;
+                    Snapshot::new_with_crc(
+                        log_segment,
+                        self.effective_table_config,
+                        Some(Arc::new(crc)),
+                        true, /* built_as_latest */
+                    )
+                }
+            })
+            .ok()
+            .map(Arc::new);
+
+        CommittedTransaction {
             commit_version,
             post_commit_stats,
-            post_commit_snapshot: Some(post_commit_snapshot),
-        })
+            post_commit_snapshot,
+        }
     }
 
     /// Build a [`CrcDelta`] from the transaction's commit state and a precomputed
@@ -1621,8 +1631,8 @@ pub struct PostCommitStats {
 ///   the future a post-commit snapshot can be obtained from the committed transaction.
 /// - [ConflictedTransaction]: the transaction conflicted with an existing version. This transcation
 ///   must be rebased before retrying. (currently no rebase APIs exist, caller must create new txn)
-/// - [RetryableTransaction]: an IO (retryable) error occurred during the commit. This transaction
-///   can be retried without rebasing.
+/// - [RetryableTransaction]: the committer returned an error after it was called. The durable
+///   effect can be indeterminate, so callers must reconcile table state before cleanup or retry.
 #[derive(Debug)]
 #[must_use]
 pub enum CommitResult<S = ExistingTable> {
@@ -1635,7 +1645,7 @@ pub enum CommitResult<S = ExistingTable> {
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
     ConflictedTransaction(ConflictedTransaction<S>),
-    /// An IO (retryable) error occurred during the commit.
+    /// The committer returned an error after it was called.
     RetryableTransaction(RetryableTransaction<S>),
 }
 
@@ -1726,12 +1736,11 @@ impl<S> ConflictedTransaction<S> {
     }
 }
 
-/// A transaction that failed to commit due to a retryable error (e.g. IO error). The transaction
-/// can be recovered with `RetryableTransaction::transaction` and retried without rebasing. The
-/// associated error can be inspected via `RetryableTransaction::error`.
+/// A transaction whose committer returned an error after it was called. The durable effect can be
+/// indeterminate. The transaction and error remain available for reconciliation-aware callers.
 #[derive(Debug)]
 pub struct RetryableTransaction<S = ExistingTable> {
-    /// The transaction that failed to commit due to a retryable error.
+    /// The transaction whose committer returned an error.
     pub transaction: Transaction<S>,
     /// Transient error that caused the commit to fail.
     pub error: Error,
@@ -1815,8 +1824,7 @@ mod tests {
         }
     }
 
-    /// A mock committer that always returns a non-retryable (non-IO) error, used to test the
-    /// terminal error path.
+    /// A mock committer that returns a non-IO error after the commit boundary is entered.
     struct GenericErrorCommitter;
 
     impl Committer for GenericErrorCommitter {
@@ -1831,6 +1839,67 @@ mod tests {
         fn is_catalog_committer(&self) -> bool {
             false
         }
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A committer that makes the filesystem commit durable and then reports an error.
+    struct CommitThenErrorCommitter;
+
+    impl Committer for CommitThenErrorCommitter {
+        fn commit(
+            &self,
+            engine: &dyn Engine,
+            actions: DeltaResultIterator<'_, FilteredEngineData>,
+            commit_metadata: CommitMetadata,
+        ) -> DeltaResult<CommitResponse> {
+            let response = FileSystemCommitter::new().commit(engine, actions, commit_metadata)?;
+            assert!(matches!(response, CommitResponse::Committed { .. }));
+            Err(Error::generic("simulated error after durable commit"))
+        }
+
+        fn is_catalog_committer(&self) -> bool {
+            false
+        }
+
+        fn publish(
+            &self,
+            _engine: &dyn Engine,
+            _publish_metadata: PublishMetadata,
+        ) -> DeltaResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A committer that succeeds, but returns metadata that cannot build a snapshot.
+    struct CommitWithInvalidMetadataCommitter;
+
+    impl Committer for CommitWithInvalidMetadataCommitter {
+        fn commit(
+            &self,
+            engine: &dyn Engine,
+            actions: DeltaResultIterator<'_, FilteredEngineData>,
+            commit_metadata: CommitMetadata,
+        ) -> DeltaResult<CommitResponse> {
+            let invalid_path = commit_metadata
+                .table_root()
+                .join("_delta_log/not-a-commit.json")?;
+            let response = FileSystemCommitter::new().commit(engine, actions, commit_metadata)?;
+            assert!(matches!(response, CommitResponse::Committed { .. }));
+            Ok(CommitResponse::Committed {
+                file_meta: FileMeta::new(invalid_path, 0, 0),
+            })
+        }
+
+        fn is_catalog_committer(&self) -> bool {
+            false
+        }
+
         fn publish(
             &self,
             _engine: &dyn Engine,
@@ -2955,20 +3024,14 @@ mod tests {
 
     #[test]
     fn test_blind_append_commit_success() -> DeltaResult<()> {
-        let (engine, mut txn, _tempdir) = create_existing_table_txn()?;
+        let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
+        let mut txn = snapshot.transaction(Box::new(GenericErrorCommitter), engine.as_ref())?;
         txn = txn.with_blind_append();
         add_dummy_file(&mut txn);
-        // Blind append with add files should pass validation and proceed to commit.
-        // The commit itself may fail due to schema mismatch with the dummy data,
-        // but we verify validation (line 415) passes on the Ok path.
-        let result = txn.commit(engine.as_ref());
-        // If it fails, it should NOT be an InvalidTransactionState error
-        if let Err(e) = result {
-            assert!(
-                !matches!(e, Error::InvalidTransactionState(_)),
-                "Blind append validation should have passed, got: {e}"
-            );
-        }
+        // The generic-error committer proves validation reached the commit boundary without
+        // writing to the shared source fixture.
+        let result = txn.commit(engine.as_ref())?;
+        assert!(matches!(result, CommitResult::RetryableTransaction(_)));
         Ok(())
     }
 
@@ -2994,6 +3057,55 @@ mod tests {
                 retryable.error
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_commit_error_can_follow_a_durable_log_commit() -> DeltaResult<()> {
+        let (table_root, _tempdir) = copy_test_table("table-without-dv-small")?;
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+        let table_root = snapshot.table_root().clone();
+        let expected_version = snapshot.version() + 1;
+        let table_path = table_root
+            .to_file_path()
+            .map_err(|_| Error::generic("failed to create test table path"))?;
+        let data_file = table_path.join("dummy");
+        std::fs::write(&data_file, b"test data")?;
+        let mut txn = snapshot.transaction(Box::new(CommitThenErrorCommitter), engine.as_ref())?;
+        add_dummy_file(&mut txn);
+
+        let result = txn.commit(engine.as_ref())?;
+        assert!(matches!(result, CommitResult::RetryableTransaction(_)));
+
+        let refreshed = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+        assert_eq!(refreshed.version(), expected_version);
+        assert!(data_file.exists());
+        let commit_json = std::fs::read_to_string(
+            table_path.join(format!("_delta_log/{expected_version:020}.json")),
+        )?;
+        assert!(commit_json.contains(r#""path":"dummy""#));
+        Ok(())
+    }
+
+    #[test]
+    fn test_post_commit_snapshot_failure_preserves_committed_outcome() -> DeltaResult<()> {
+        let (table_root, _tempdir) = copy_test_table("table-without-dv-small")?;
+        let engine: Arc<dyn Engine> = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(table_root.clone()).build(engine.as_ref())?;
+        let expected_version = snapshot.version() + 1;
+        let mut txn = snapshot.transaction(
+            Box::new(CommitWithInvalidMetadataCommitter),
+            engine.as_ref(),
+        )?;
+        add_dummy_file(&mut txn);
+
+        let committed = txn.commit(engine.as_ref())?.unwrap_committed();
+        assert_eq!(committed.commit_version(), expected_version);
+        assert!(committed.post_commit_snapshot().is_none());
+
+        let refreshed = Snapshot::builder_for(table_root).build(engine.as_ref())?;
+        assert_eq!(refreshed.version(), expected_version);
         Ok(())
     }
 
@@ -3511,13 +3623,14 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_terminal_error_emits_error_failure_metric() -> DeltaResult<()> {
+    fn test_commit_generic_error_is_indeterminate_and_emits_error_metric() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
         let reporter = Arc::new(CapturingReporter::default());
         let _guard = install_thread_local_metrics_reporter(reporter.clone());
         let mut txn = snapshot.transaction(Box::new(GenericErrorCommitter), engine.as_ref())?;
         add_dummy_file(&mut txn);
-        assert!(txn.commit(engine.as_ref()).is_err());
+        let result = txn.commit(engine.as_ref())?;
+        assert!(matches!(result, CommitResult::RetryableTransaction(_)));
         let failure = commit_failure_event(&reporter).expect("commit failure event");
         assert_eq!(failure.reason, CommitFailureReason::Error);
         assert_eq!(failure.table_type, TableType::PathBased);

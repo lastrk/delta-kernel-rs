@@ -65,6 +65,31 @@ pub struct ExclusiveCreateTransaction;
 #[handle_descriptor(target=CommittedTransaction, mutable=true, sized=true)]
 pub struct ExclusiveCommittedTransaction;
 
+/// Typed result of an existing-table commit attempt.
+///
+/// `NoEffect` means validation failed before the committer was called. `Conflict` means another
+/// transaction already owns the attempted Delta log version. `Indeterminate` means the committer
+/// returned an untyped error after it was called, so the caller must reconcile durable state.
+///
+/// The caller owns the handle in `Committed` and must release it with
+/// [`free_committed_transaction`].
+///
+/// cbindgen:prefix-with-name=true
+#[repr(C)]
+pub enum FfiTransactionCommitOutcome {
+    /// The Delta log commit succeeded.
+    Committed(Handle<ExclusiveCommittedTransaction>),
+    /// The attempted Delta log version already exists.
+    Conflict {
+        /// The Delta log version that caused the conflict.
+        version: u64,
+    },
+    /// Validation failed before the committer was called.
+    NoEffect,
+    /// The committer returned an error whose durable effect is unknown.
+    Indeterminate,
+}
+
 /// Handle for a mutable boxed committer that can be passed across FFI
 #[handle_descriptor(target = dyn Committer, mutable = true, sized = false)]
 pub struct MutableCommitter;
@@ -441,6 +466,36 @@ pub unsafe extern "C" fn commit(
     let engine = extern_engine.engine();
     commit_result_to_committed_handle(txn.commit(engine.as_ref()))
         .into_extern_result(&extern_engine)
+}
+
+/// Attempt to commit an existing-table transaction and preserve its durable-effect category.
+///
+/// Unlike [`commit`], this function does not convert conflicts or retryable commit errors into a
+/// generic FFI error. It lets an engine decide when file cleanup is safe.
+///
+/// # Safety
+///
+/// The caller is responsible for passing valid handles and must not use `txn` after this call.
+#[no_mangle]
+pub unsafe extern "C" fn commit_with_outcome(
+    txn: Handle<ExclusiveTransaction>,
+    engine: Handle<SharedExternEngine>,
+) -> FfiTransactionCommitOutcome {
+    let txn = unsafe { txn.into_inner() };
+    let extern_engine = unsafe { engine.as_ref() };
+    let engine = extern_engine.engine();
+    match txn.commit(engine.as_ref()) {
+        Ok(CommitResult::CommittedTransaction(committed)) => {
+            FfiTransactionCommitOutcome::Committed(Box::new(committed).into())
+        }
+        Ok(CommitResult::ConflictedTransaction(conflicted)) => {
+            FfiTransactionCommitOutcome::Conflict {
+                version: conflicted.conflict_version(),
+            }
+        }
+        Ok(CommitResult::RetryableTransaction(_)) => FfiTransactionCommitOutcome::Indeterminate,
+        Err(_) => FfiTransactionCommitOutcome::NoEffect,
+    }
 }
 
 // ============================================================================

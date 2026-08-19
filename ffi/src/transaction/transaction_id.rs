@@ -72,6 +72,24 @@ fn get_app_id_version_impl(
     snapshot.get_app_id_version(&app_id_res?, extern_engine.engine().as_ref())
 }
 
+/// Return whether this snapshot can expire `SetTransaction` markers.
+///
+/// A caller that needs durable idempotency must reject an append when this returns `true`.
+///
+/// # Safety
+///
+/// The caller must provide a valid snapshot handle.
+#[no_mangle]
+pub unsafe extern "C" fn has_set_transaction_retention_duration(
+    snapshot: Handle<SharedSnapshot>,
+) -> bool {
+    let snapshot = unsafe { snapshot.as_ref() };
+    snapshot
+        .table_properties()
+        .set_transaction_retention_duration
+        .is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
