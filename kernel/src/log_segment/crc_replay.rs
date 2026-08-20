@@ -28,40 +28,36 @@ use crate::crc::{
     FileSizeHistogram, FileStatsDelta,
 };
 use crate::engine_data::{GetData, TypedGetData as _};
+use crate::metrics::ProtocolMetadataSource;
 use crate::path::ParsedLogPath;
 use crate::schema::{
-    column_name, schema, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec, SchemaRef,
+    column_name, lazy_schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
+    SchemaRef, StructField,
 };
 use crate::snapshot::IncrementalReplay;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
 
-#[allow(clippy::expect_used)]
-static REPLAY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let base = schema! {
-        // size is the only Add leaf the visitor reads, and it is required, so its presence marks
-        // an Add row.
-        nullable ADD_NAME: { not_null "size": LONG },
-        // remove.size is optional, so we read remove.path (required) to know a row is a Remove
-        // before reading its size.
-        nullable REMOVE_NAME: {
-            not_null "path": STRING,
-            nullable "size": LONG,
-        },
-        (&PROTOCOL_FIELD),
-        (&METADATA_FIELD),
-        (&SET_TRANSACTION_FIELD),
-        (&DOMAIN_METADATA_FIELD),
-        nullable COMMIT_INFO_NAME: {
-            nullable "operation": STRING,
-            nullable "inCommitTimestamp": LONG,
-        },
-    };
-    let with_file = base
-        .add_metadata_column("_file", MetadataColumnSpec::FilePath)
-        .expect("add _file metadata column");
-    Arc::new(with_file)
-});
+static REPLAY_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    // size is the only Add leaf the visitor reads, and it is required, so its presence marks
+    // an Add row.
+    nullable ADD_NAME: { not_null "size": LONG },
+    // remove.size is optional, so we read remove.path (required) to know a row is a Remove
+    // before reading its size.
+    nullable REMOVE_NAME: {
+        not_null "path": STRING,
+        nullable "size": LONG,
+    },
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+    nullable COMMIT_INFO_NAME: {
+        nullable "operation": STRING,
+        nullable "inCommitTimestamp": LONG,
+    },
+    (StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath)),
+};
 
 impl LogSegment {
     /// Try to build the CRC at this segment's `end_version` from the caller's resolved `base` CRC.
@@ -75,23 +71,26 @@ impl LogSegment {
         engine: &dyn Engine,
         base: Option<&Arc<Crc>>,
         incremental_replay: IncrementalReplay,
-    ) -> DeltaResult<Option<Arc<Crc>>> {
+    ) -> DeltaResult<Option<(Arc<Crc>, ProtocolMetadataSource)>> {
         let Some(base) = base else {
             return Ok(None);
         };
         if base.version == self.end_version {
-            return Ok(Some(base.clone()));
+            return Ok(Some((base.clone(), ProtocolMetadataSource::CrcAtTarget)));
         }
         if !incremental_replay.should_advance(base.version, self.end_version)? {
             return Ok(None);
         }
         let advanced = self.build_crc_from_base(engine, base)?;
-        Ok(Some(Arc::new(advanced)))
+        Ok(Some((
+            Arc::new(advanced),
+            ProtocolMetadataSource::CrcAdvancedByReplay,
+        )))
     }
 
     /// Pick the latest CRC to use as an advance base: this segment's on-disk CRC or
-    /// `in_memory_base` (e.g. the CRC an updating snapshot holds), whichever is newer. A failed
-    /// on-disk read falls back to `in_memory_base`. Returns None when neither is available.
+    /// `in_memory_base`, whichever is newer, falling back to `in_memory_base` on a failed on-disk
+    /// read. Drops a base below the checkpoint; returns None when no candidate remains.
     pub(crate) fn pick_latest_base_crc(
         &self,
         engine: &dyn Engine,
@@ -105,6 +104,10 @@ impl LogSegment {
         preferred_disk_crc
             .and_then(|f| read_crc_file_or_none(engine, f))
             .or_else(|| in_memory_base.cloned())
+            .filter(|crc| {
+                self.checkpoint_version
+                    .is_none_or(|ckpt| crc.version >= ckpt)
+            })
     }
 
     /// Read this segment's latest on-disk CRC (`latest_crc_file`), at whatever version it sits.
@@ -156,7 +159,14 @@ impl LogSegment {
         let mut acc = CrcReplayAccumulator::new(Some(FileSizeHistogram::create_default()));
         // Read only the checkpoint parquet plus any V2 sidecars via `create_checkpoint_stream`.
         let batches = self
-            .create_checkpoint_stream(engine, CHECKPOINT_CRC_SCHEMA.clone(), None, None, None)?
+            .create_checkpoint_stream(
+                engine,
+                CHECKPOINT_CRC_SCHEMA.clone(),
+                None,
+                None,
+                None,
+                None,
+            )?
             .actions;
         for batch in batches {
             let batch = batch?;
@@ -627,16 +637,13 @@ impl RowVisitor for CommitCrcVisitor<'_> {
 /// accumulator needs. `add.size` is the only Add leaf read, and it is required, so its presence
 /// marks an Add row (a checkpoint Add missing `size` errors at read time). A checkpoint has no
 /// `remove` or `commitInfo` to project.
-#[allow(clippy::expect_used)]
-static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(schema! {
-        nullable ADD_NAME: { not_null "size": LONG },
-        (&PROTOCOL_FIELD),
-        (&METADATA_FIELD),
-        (&SET_TRANSACTION_FIELD),
-        (&DOMAIN_METADATA_FIELD),
-    })
-});
+static CHECKPOINT_CRC_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable ADD_NAME: { not_null "size": LONG },
+    (&PROTOCOL_FIELD),
+    (&METADATA_FIELD),
+    (&SET_TRANSACTION_FIELD),
+    (&DOMAIN_METADATA_FIELD),
+};
 
 // A checkpoint has no source-specific columns, so its projection is the shared columns.
 
@@ -684,6 +691,7 @@ mod tests {
 
     #[rstest::rstest]
     #[case::safe("WRITE", true)]
+    #[case::streaming_update("STREAMING UPDATE", true)]
     #[case::unsafe_op("ANALYZE STATS", false)]
     fn on_commit_info_classifies_operation(#[case] op: &str, #[case] is_safe: bool) {
         let mut acc = CrcReplayAccumulator::new(None);

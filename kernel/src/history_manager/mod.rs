@@ -30,7 +30,7 @@ use tracing::{info, trace, warn};
 use url::Url;
 
 use crate::log_segment::LogSegment;
-use crate::log_segment_files::{list_from_storage, should_process_log_file};
+use crate::log_segment_files::{list_delta_log_from_storage, should_process_log_file};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::InCommitTimestampEnablement;
@@ -718,7 +718,7 @@ fn get_earliest_published_commit_version(
     log_root: &Url,
     earliest_ratified_commit_version: Option<Version>,
 ) -> DeltaResult<Version> {
-    list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
+    list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?
         .filter_ok(|f| f.file_type == LogPathFileType::Commit)
         .next()
         .transpose()?
@@ -768,7 +768,8 @@ fn get_earliest_recreatable_commit(
     let mut multi_part_checkpoint_progress = HashMap::<(Version, u32), HashSet<u32>>::new();
     let mut earliest_commit_version: Option<Version> = None;
 
-    let listing = list_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
+    let listing =
+        list_delta_log_from_storage(engine.storage_handler().as_ref(), log_root, 0, Version::MAX)?;
     for parsed_result in listing {
         let parsed_log_path = parsed_result?;
         if !should_process_log_file(&parsed_log_path) {
@@ -793,7 +794,7 @@ fn get_earliest_recreatable_commit(
                     }
                 }
             }
-            LogPathFileType::SinglePartCheckpoint | LogPathFileType::UuidCheckpoint => {
+            LogPathFileType::ClassicCheckpoint | LogPathFileType::UuidCheckpoint => {
                 last_complete_checkpoint = Some(parsed_log_path.version);
             }
             LogPathFileType::MultiPartCheckpoint {
@@ -908,18 +909,17 @@ mod tests {
     use crate::actions::{CommitInfo, Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::schema::{DataType, SchemaRef, StructField, StructType};
+    use crate::schema::{schema_ref, SchemaRef};
     use crate::snapshot::{Snapshot, SnapshotBuilder};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{Action, LocalMockTable};
+    use crate::unit_test_utils::{Action, LocalMockTable};
     use crate::utils::FoldWithOption as _;
     use crate::Version;
 
     fn get_test_schema() -> SchemaRef {
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            DataType::INTEGER,
-        )]))
+        schema_ref! {
+            nullable "value": INTEGER,
+        }
     }
 
     fn set_mod_time(mock_table: &LocalMockTable, version: Version, timestamp: Timestamp) {

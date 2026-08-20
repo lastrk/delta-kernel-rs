@@ -46,6 +46,8 @@ enum LitType {
   Timestamp,
   TimestampNtz,
   Date,
+  IntervalYearMonth,
+  IntervalDayTime,
   Binary,
   Decimal,
   Null,
@@ -116,6 +118,16 @@ struct OpaquePredicate {
 };
 struct Unknown {
   char* name;
+};
+// A column is a list of field-name parts. Keeping the parts structured (rather than a single
+// dotted string) lets a field name that itself contains a period survive the FFI round-trip.
+struct ColumnPart {
+  char* ptr;
+  size_t len;
+};
+struct Column {
+  struct ColumnPart* parts;
+  size_t len;
 };
 struct MapToStructExpr {
   ExpressionItemList child_expr;
@@ -235,6 +247,16 @@ DEFINE_SIMPLE_SCALAR(visit_expr_boolean_literal, Boolean, _Bool, boolean_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_timestamp_literal, Timestamp, int64_t, long_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_timestamp_ntz_literal, TimestampNtz, int64_t, long_data);
 DEFINE_SIMPLE_SCALAR(visit_expr_date_literal, Date, int32_t, integer_data);
+DEFINE_SIMPLE_SCALAR(
+    visit_expr_interval_year_month_literal,
+    IntervalYearMonth,
+    int32_t,
+    integer_data);
+DEFINE_SIMPLE_SCALAR(
+    visit_expr_interval_day_time_literal,
+    IntervalDayTime,
+    int64_t,
+    long_data);
 #undef DEFINE_SIMPLE_SCALAR
 
 void visit_expr_string_literal(void* data, uintptr_t sibling_list_id, KernelStringSlice string) {
@@ -456,9 +478,18 @@ DEFINE_UNARY(visit_expr_not, Not)
 /*************************************************************
  * Column Expression
  ************************************************************/
-void visit_expr_column(void* data, uintptr_t sibling_id_list, KernelStringSlice col_name) {
-  char* column_name = allocate_string(col_name);
-  put_expr_item(data, sibling_id_list, column_name, Column);
+void visit_expr_column(void* data,
+                       uintptr_t sibling_id_list,
+                       const KernelStringSlice* parts,
+                       uintptr_t parts_len) {
+  struct Column* column = malloc(sizeof(struct Column));
+  column->len = parts_len;
+  column->parts = malloc(sizeof(struct ColumnPart) * parts_len);
+  for (size_t i = 0; i < parts_len; i++) {
+    column->parts[i].ptr = allocate_string(parts[i]);
+    column->parts[i].len = parts[i].len;
+  }
+  put_expr_item(data, sibling_id_list, column, Column);
 }
 
 /*************************************************************
@@ -491,6 +522,8 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_literal_timestamp = visit_expr_timestamp_literal,
     .visit_literal_timestamp_ntz = visit_expr_timestamp_ntz_literal,
     .visit_literal_date = visit_expr_date_literal,
+    .visit_literal_interval_year_month = visit_expr_interval_year_month_literal,
+    .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
     .visit_literal_binary = visit_expr_binary_literal,
     .visit_literal_null = visit_expr_null_literal,
     .visit_literal_decimal = visit_expr_decimal_literal,
@@ -543,6 +576,8 @@ ExpressionItemList construct_predicate(SharedPredicate* predicate) {
     .visit_literal_timestamp = visit_expr_timestamp_literal,
     .visit_literal_timestamp_ntz = visit_expr_timestamp_ntz_literal,
     .visit_literal_date = visit_expr_date_literal,
+    .visit_literal_interval_year_month = visit_expr_interval_year_month_literal,
+    .visit_literal_interval_day_time = visit_expr_interval_day_time_literal,
     .visit_literal_binary = visit_expr_binary_literal,
     .visit_literal_null = visit_expr_null_literal,
     .visit_literal_decimal = visit_expr_decimal_literal,
@@ -667,6 +702,8 @@ void free_expression_item(ExpressionItem ref) {
         case Timestamp:
         case TimestampNtz:
         case Date:
+        case IntervalYearMonth:
+        case IntervalDayTime:
         case Decimal:
         case Null:
           break;
@@ -681,7 +718,12 @@ void free_expression_item(ExpressionItem ref) {
       break;
     }
     case Column: {
-      free(ref.ref);
+      struct Column* column = ref.ref;
+      for (size_t i = 0; i < column->len; i++) {
+        free(column->parts[i].ptr);
+      }
+      free(column->parts);
+      free(column);
       break;
     }
     case MapToStruct: {

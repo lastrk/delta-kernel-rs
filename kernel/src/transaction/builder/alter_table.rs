@@ -114,8 +114,8 @@ impl<S: Chainable> AlterTableTransactionBuilder<S> {
     ///
     /// The field must not already exist in the schema (case-insensitive). The field must be
     /// nullable because existing data files do not contain this column and will read NULL for it.
-    /// `field` and any of its nested fields must not carry `delta.columnMapping.id` or
-    /// `delta.columnMapping.physicalName` annotations.
+    /// On column-mapping tables, Kernel assigns or preserves column-mapping IDs and physical names
+    /// for the added field.
     ///
     /// These constraints are validated during [`build()`](AlterTableTransactionBuilder::build).
     pub fn add_column(mut self, field: StructField) -> AlterTableTransactionBuilder<Modifying> {
@@ -146,6 +146,8 @@ impl AlterTableTransactionBuilder<Modifying> {
     ///
     /// # Errors
     ///
+    /// - The table enables `icebergCompatV3` or `allowColumnDefaults`, which ALTER TABLE does not
+    ///   yet support
     /// - Any individual operation fails validation (see per-method errors above)
     /// - Table does not support writes (unsupported features)
     /// - The evolved schema requires protocol features not enabled on the table (e.g. adding a

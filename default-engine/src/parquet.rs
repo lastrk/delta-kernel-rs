@@ -11,8 +11,7 @@ use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
 use delta_kernel::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
+    fixup_parquet_read, ordering_needs_row_indexes, parquet_read_plan, RowIndexBuilder,
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use delta_kernel::engine::{reader_options, writer_options};
@@ -28,10 +27,11 @@ use delta_kernel::parquet::arrow::async_reader::{
 };
 use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
 use delta_kernel::schema::{SchemaRef, StructType};
-use delta_kernel::transaction::WriteContext;
+use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
-    DeltaResult, DeltaResultIteratorStatic, EngineData, Error, FileDataReadResultIterator,
-    FileMeta, ParquetFooter, ParquetHandler, PredicateRef,
+    CancellationTokenRef, DeltaResult, DeltaResultIteratorStatic, EngineData, Error,
+    FileDataReadResultIterator, FileMeta, FoldWithOption as _, ParquetFooter, ParquetHandler,
+    PredicateRef,
 };
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
@@ -195,12 +195,13 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         stats_columns: &[ColumnName],
+        physical_schema: &StructType,
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
 
         // Collect statistics before writing (includes numRecords)
-        let stats = collect_stats(record_batch, stats_columns)?;
+        let stats = collect_stats(record_batch, stats_columns, physical_schema)?;
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new_with_options(
@@ -241,24 +242,25 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         Ok(DataFileMetadata::new(file_meta, stats))
     }
 
-    /// Write `data` to a new parquet file under the [`WriteContext::write_dir`] and return
+    /// Write `data` to a new parquet file under the [`BoundWriteContext::write_dir`] and return
     /// Add action metadata ready for [`Transaction::add_files`].
     ///
     /// Note that the schema does not contain the dataChange column. In order to set `data_change`
     /// flag, use [`delta_kernel::transaction::Transaction::with_data_change`].
     ///
-    /// [`WriteContext::write_dir`]: delta_kernel::transaction::WriteContext::write_dir
+    /// [`BoundWriteContext::write_dir`]: delta_kernel::transaction::BoundWriteContext::write_dir
     /// [`Transaction::add_files`]: delta_kernel::transaction::Transaction::add_files
     pub async fn write_parquet_file(
         &self,
         data: Box<dyn EngineData>,
-        write_context: &WriteContext,
+        write_context: &BoundWriteContext,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let file_metadata = self
             .write_parquet(
                 &write_context.write_dir(),
                 data,
                 write_context.stats_columns(),
+                write_context.physical_schema().as_ref(),
             )
             .await?;
         super::build_add_file_metadata(file_metadata, write_context)
@@ -325,6 +327,16 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
+        self.read_parquet_files_with_cancellation(files, physical_schema, predicate, None)
+    }
+
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
         let future = read_parquet_files_impl(
             self.store.clone(),
             files.to_vec(),
@@ -333,7 +345,11 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             self.buffer_size.get(),
             self.batch_size.get(),
         );
-        super::stream_future_to_iter(self.task_executor.clone(), future)
+        super::stream_future_to_cancellable_iter(
+            self.task_executor.clone(),
+            future,
+            cancellation_token,
+        )
     }
 
     /// Writes engine data to a Parquet file at the specified location.
@@ -390,11 +406,19 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        self.read_parquet_footer_with_cancellation(file, None)
+    }
+
+    fn read_parquet_footer_with_cancellation(
+        &self,
+        file: &FileMeta,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<ParquetFooter> {
         let store = self.store.clone();
         let location = file.location.clone();
         let file_size = file.size;
 
-        self.task_executor.block_on(async move {
+        let footer_future = async move {
             let metadata = if location.is_presigned() {
                 let client = reqwest::Client::new();
                 let response =
@@ -412,11 +436,16 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
 
-            let schema = StructType::try_from_arrow(metadata.schema().as_ref())
-                .map(Arc::new)
-                .map_err(Error::Arrow)?;
+            let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
             Ok(ParquetFooter { schema })
-        })
+        };
+
+        // Race the footer read against cancellation so a cancelled request stops promptly.
+        match cancellation_token {
+            Some(token) => super::block_on_or_cancelled(&self.task_executor, token, footer_future)
+                .unwrap_or(Err(Error::Cancelled)),
+            None => self.task_executor.block_on(footer_future),
+        }
     }
 }
 
@@ -459,32 +488,21 @@ async fn open_parquet_file(
     };
 
     let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?;
-    let parquet_schema = metadata.schema();
-    let (indices, requested_ordering) = get_requested_indices(&table_schema, parquet_schema)?;
-    let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata.clone());
-    if let Some(mask) = generate_mask(
-        &table_schema,
-        parquet_schema,
-        builder.parquet_schema(),
-        &indices,
-    ) {
-        builder = builder.with_projection(mask)
-    }
+    let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
 
-    // Only create RowIndexBuilder if row indexes are actually needed
     let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-        .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+        .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
 
-    // Filter row groups and row indexes if a predicate is provided
-    if let Some(ref predicate) = predicate {
-        builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
-    }
-    if let Some(limit) = limit {
-        builder = builder.with_limit(limit)
-    }
+    let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata)
+        .fold_with(mask, ParquetRecordBatchStreamBuilder::with_projection)
+        .fold_with(predicate, |builder, predicate| {
+            builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
+        })
+        .fold_with(limit, ParquetRecordBatchStreamBuilder::with_limit)
+        .with_batch_size(batch_size);
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
-    let stream = builder.with_batch_size(batch_size).build()?;
+    let stream = builder.build()?;
 
     let stream = stream.map(move |rbr| {
         fixup_parquet_read(
@@ -537,34 +555,19 @@ impl FileOpener for PresignedUrlOpener {
             // fetch the file from the interweb
             let reader = client.get(&file_location).send().await?.bytes().await?;
             let metadata = ArrowReaderMetadata::load(&reader, reader_options())?;
-            let parquet_schema = metadata.schema();
-            let (indices, requested_ordering) =
-                get_requested_indices(&table_schema, parquet_schema)?;
+            let (requested_ordering, mask) = parquet_read_plan(&table_schema, &metadata)?;
 
-            let mut builder =
-                ParquetRecordBatchReaderBuilder::new_with_metadata(reader, metadata.clone());
-            if let Some(mask) = generate_mask(
-                &table_schema,
-                parquet_schema,
-                builder.parquet_schema(),
-                &indices,
-            ) {
-                builder = builder.with_projection(mask)
-            }
-
-            // Only create RowIndexBuilder if row indexes are actually needed
             let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
-                .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+                .then(|| RowIndexBuilder::new(metadata.metadata().row_groups()));
 
-            // Filter row groups and row indexes if a predicate is provided
-            if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
-            }
-            if let Some(limit) = limit {
-                builder = builder.with_limit(limit)
-            }
-
-            let reader = builder.with_batch_size(batch_size).build()?;
+            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(reader, metadata)
+                .fold_with(mask, ParquetRecordBatchReaderBuilder::with_projection)
+                .fold_with(predicate, |builder, predicate| {
+                    builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut())
+                })
+                .fold_with(limit, ParquetRecordBatchReaderBuilder::with_limit)
+                .with_batch_size(batch_size)
+                .build()?;
 
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = futures::stream::iter(reader);
@@ -610,7 +613,7 @@ mod tests {
     };
     use delta_kernel::parquet::arrow::{ARROW_SCHEMA_META_KEY, PARQUET_FIELD_ID_META_KEY};
     use delta_kernel::schema::{
-        ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+        schema, schema_ref, ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
     };
     use delta_kernel::EngineData;
     use delta_kernel_default_engine_test_utils::{
@@ -630,6 +633,10 @@ mod tests {
     use super::*;
     use crate::executor::tokio::TokioBackgroundExecutor;
     use crate::DEFAULT_BATCH_SIZE;
+
+    fn long_schema(name: &str) -> StructType {
+        schema! { nullable (name): LONG }
+    }
 
     /// Test `ObjectStore` that counts footer fetches. `get_opts` (footer range GETs) is counted;
     /// column-chunk data goes through `get_ranges` and is not counted, so the count isolates
@@ -1053,9 +1060,15 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
 
         let write_metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
             .await
             .unwrap();
 
@@ -1132,10 +1145,16 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
 
         assert_result_error_with_message(
             parquet_handler
-                .write_parquet(&Url::parse("memory:///data").unwrap(), data, &[])
+                .write_parquet(
+                    &Url::parse("memory:///data").unwrap(),
+                    data,
+                    &[],
+                    &physical_schema,
+                )
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
@@ -1639,21 +1658,18 @@ mod tests {
         writer.close().unwrap();
 
         // Create kernel schema with DIFFERENT names but SAME field IDs
-        let kernel_schema = Arc::new(
-            StructType::try_new(vec![
-                StructField::new("user_id", delta_kernel::schema::DataType::LONG, false)
+        let kernel_schema = schema_ref! {
+            (StructField::not_null("user_id", delta_kernel::schema::DataType::LONG)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(1),
-                    )]),
-                StructField::new("user_name", delta_kernel::schema::DataType::STRING, false)
+                    )])),
+            (StructField::not_null("user_name", delta_kernel::schema::DataType::STRING)
                     .with_metadata([(
                         ColumnMetadataKey::ParquetFieldId.as_ref(),
                         MetadataValue::Number(2),
-                    )]),
-            ])
-            .unwrap(),
-        );
+                    )])),
+        };
 
         // Read using kernel schema with different column names
         let store = Arc::new(LocalFileSystem::new());
@@ -1714,8 +1730,14 @@ mod tests {
             )])
             .unwrap(),
         ));
+        let physical_schema = long_schema("a");
         let metadata = parquet_handler
-            .write_parquet(&Url::parse("memory:///data/").unwrap(), data, &[])
+            .write_parquet(
+                &Url::parse("memory:///data/").unwrap(),
+                data,
+                &[],
+                &physical_schema,
+            )
             .await
             .unwrap();
 

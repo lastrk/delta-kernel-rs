@@ -369,9 +369,12 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                         Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
                     }
                     PrimitiveType::Void => Ok(ArrowDataType::Null),
-                    PrimitiveType::IntervalYearMonth | PrimitiveType::IntervalDayTime => {
+                    PrimitiveType::IntervalYearMonth => Ok(ArrowDataType::Int32),
+                    PrimitiveType::IntervalDayTime => Ok(ArrowDataType::Int64),
+                    #[cfg(feature = "geo-type-in-dev")]
+                    PrimitiveType::Geometry(_) | PrimitiveType::Geography(_) => {
                         Err(ArrowError::SchemaError(format!(
-                            "Interval types are not yet supported in the default engine: {p}"
+                            "Geo types are not yet supported in the default engine: {p}"
                         )))
                     }
                 }
@@ -661,15 +664,39 @@ mod tests {
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::schema::EdgeInterpolationAlgorithm;
     use crate::schema::{
-        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+        schema, ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType,
+        StructField, StructType,
     };
     use crate::transforms::{transform_output_type, SchemaTransform};
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         array_in_map_kernel_schema, assert_result_error_with_message, collect_arrow_field_metadata,
         complex_nested_with_field_ids,
     };
+    #[cfg(feature = "geo-type-in-dev")]
+    use crate::unit_test_utils::{geography_type, geometry_type};
     use crate::DeltaResult;
+
+    #[cfg(feature = "geo-type-in-dev")]
+    #[rstest]
+    #[case(geometry_type("EPSG:4326"))]
+    #[case(geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical))]
+    #[case(DataType::from(schema! {
+        nullable "g": (geometry_type("EPSG:4326")),
+    }))]
+    #[case(DataType::from(ArrayType::new(geometry_type("EPSG:4326"), true)))]
+    #[case(DataType::from(MapType::new(
+        DataType::STRING,
+        geography_type("EPSG:4326", EdgeInterpolationAlgorithm::Spherical),
+        true,
+    )))]
+    fn test_geo_type_arrow_conversion_unsupported(#[case] dt: DataType) {
+        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
+        let err = result.unwrap_err();
+        assert!(matches!(err, ArrowError::SchemaError(_)), "got: {err:?}");
+    }
 
     #[test]
     fn test_metadata_string_conversion() -> DeltaResult<()> {
@@ -709,6 +736,18 @@ mod tests {
         let kernel_type = DataType::try_from_arrow(&ArrowDataType::Null)?;
         assert_eq!(kernel_type, DataType::Primitive(PrimitiveType::Void));
 
+        Ok(())
+    }
+
+    // Asserts forward direction of Interval column mapping (year-month/day-time to Int32/Int64)
+    #[rstest]
+    #[case(DataType::INTERVAL_YEAR_MONTH, ArrowDataType::Int32)]
+    #[case(DataType::INTERVAL_DAY_TIME, ArrowDataType::Int64)]
+    fn test_interval_type_arrow_conversion(
+        #[case] kernel_type: DataType,
+        #[case] expected: ArrowDataType,
+    ) -> DeltaResult<()> {
+        assert_eq!(ArrowDataType::try_from_kernel(&kernel_type)?, expected);
         Ok(())
     }
 
@@ -760,10 +799,10 @@ mod tests {
     #[test]
     fn test_void_field_in_struct() -> DeltaResult<()> {
         // A struct schema with a void column should convert to Arrow with a Null field
-        let schema = StructType::try_new([
-            StructField::nullable("id", DataType::INTEGER),
-            StructField::nullable("void_col", DataType::VOID),
-        ])?;
+        let schema = schema! {
+            nullable "id": INTEGER,
+            nullable "void_col": VOID,
+        };
 
         let arrow_schema = ArrowSchema::try_from_kernel(&schema)?;
         assert_eq!(arrow_schema.fields().len(), 2);
@@ -797,15 +836,6 @@ mod tests {
             .to_string()
             .contains("Incorrect Variant Schema"));
         Ok(())
-    }
-
-    // Make sure that interval types error gracefully since unsupported
-    #[rstest]
-    #[case(DataType::INTERVAL_YEAR_MONTH)]
-    #[case(DataType::INTERVAL_DAY_TIME)]
-    fn test_interval_type_arrow_conversion_unsupported(#[case] dt: DataType) {
-        let result: Result<ArrowDataType, _> = (&dt).try_into_arrow();
-        assert!(matches!(result.unwrap_err(), ArrowError::SchemaError(_)));
     }
 
     /// Helper visitor to collect all field IDs from a kernel StructType
@@ -923,68 +953,56 @@ mod tests {
         // }
 
         // Build nested struct
-        let inner_struct_type = StructType::try_new(vec![StructField::new(
-            "inner_field",
-            DataType::STRING,
-            false,
-        )
-        .with_metadata([(
-            ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::Number(3),
-        )])])?;
+        let inner_struct_type = schema! {
+            (StructField::not_null("inner_field", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(3),
+            )])),
+        };
 
         // Build array element struct
-        let array_item_struct = StructType::try_new(vec![StructField::new(
-            "array_item",
-            DataType::INTEGER,
-            false,
-        )
-        .with_metadata([(
-            ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::Number(5),
-        )])])?;
+        let array_item_struct = schema! {
+            (StructField::not_null("array_item", DataType::INTEGER).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(5),
+            )])),
+        };
         let array_type = ArrayType::new(array_item_struct, false);
 
         // Build map with struct key and struct value (both with field IDs)
-        let map_key_struct = StructType::try_new(vec![StructField::new(
-            "map_key_field",
-            DataType::STRING,
-            false,
-        )
-        .with_metadata([(
-            ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::Number(7),
-        )])])?;
-        let map_value_struct = StructType::try_new(vec![StructField::new(
-            "map_value_field",
-            DataType::INTEGER,
-            false,
-        )
-        .with_metadata([(
-            ColumnMetadataKey::ParquetFieldId.as_ref(),
-            MetadataValue::Number(8),
-        )])])?;
+        let map_key_struct = schema! {
+            (StructField::not_null("map_key_field", DataType::STRING).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(7),
+            )])),
+        };
+        let map_value_struct = schema! {
+            (StructField::not_null("map_value_field", DataType::INTEGER).with_metadata([(
+                ColumnMetadataKey::ParquetFieldId.as_ref(),
+                MetadataValue::Number(8),
+            )])),
+        };
         let map_type = MapType::new(map_key_struct, map_value_struct, false);
 
         // Build top-level struct
-        let top_struct = StructType::try_new(vec![
-            StructField::new("simple_field", DataType::INTEGER, false).with_metadata([(
+        let top_struct = schema! {
+            (StructField::not_null("simple_field", DataType::INTEGER).with_metadata([(
                 ColumnMetadataKey::ParquetFieldId.as_ref(),
                 MetadataValue::Number(1),
-            )]),
-            StructField::new("nested_struct", inner_struct_type, false).with_metadata([(
+            )])),
+            (StructField::not_null("nested_struct", inner_struct_type).with_metadata([(
                 ColumnMetadataKey::ParquetFieldId.as_ref(),
                 MetadataValue::Number(2),
-            )]),
-            StructField::new("array_field", array_type, false).with_metadata([(
+            )])),
+            (StructField::not_null("array_field", array_type).with_metadata([(
                 ColumnMetadataKey::ParquetFieldId.as_ref(),
                 MetadataValue::Number(4),
-            )]),
-            StructField::new("map_field", map_type, false).with_metadata([(
+            )])),
+            (StructField::not_null("map_field", map_type).with_metadata([(
                 ColumnMetadataKey::ParquetFieldId.as_ref(),
                 MetadataValue::Number(6),
-            )]),
-        ])?;
+            )])),
+        };
 
         // Convert to Arrow schema
         let arrow_schema = ArrowSchema::try_from_kernel(&top_struct)?;

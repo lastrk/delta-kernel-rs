@@ -14,8 +14,9 @@ use crate::schema::validation::validate_schema;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{
-    find_max_column_id_in_schema, try_assign_flat_column_mapping_info, validate_column_mapping_id,
-    validate_schema_column_mapping_strict, ColumnMappingMode, Operation, TableFeature,
+    find_max_column_id_in_schema, schema_has_column_mapping_metadata,
+    strip_stray_column_mapping_metadata, try_assign_flat_column_mapping_info,
+    validate_column_mapping_id, ColumnMappingMode, Operation, TableFeature,
 };
 use crate::table_properties::COLUMN_MAPPING_MAX_COLUMN_ID;
 use crate::utils::FoldWithOption as _;
@@ -96,6 +97,37 @@ pub(crate) struct SchemaEvolutionResult {
     pub new_max_column_id: Option<i64>,
 }
 
+fn find_field_metadata_path(field: &StructField, key: &str) -> Option<String> {
+    fn find_in_type(data_type: &DataType, path: &str, key: &str) -> Option<String> {
+        match data_type {
+            DataType::Struct(fields) | DataType::Variant(fields) => {
+                for field in fields.fields() {
+                    let nested = format!("{path}.{}", field.name());
+                    if field.metadata.contains_key(key) {
+                        return Some(nested);
+                    }
+                    if let Some(path) = find_in_type(field.data_type(), &nested, key) {
+                        return Some(path);
+                    }
+                }
+                None
+            }
+            DataType::Array(array) => {
+                find_in_type(array.element_type(), &format!("{path}.element"), key)
+            }
+            DataType::Map(map) => find_in_type(map.key_type(), &format!("{path}.key"), key)
+                .or_else(|| find_in_type(map.value_type(), &format!("{path}.value"), key)),
+            DataType::Primitive(_) => None,
+        }
+    }
+
+    if field.metadata.contains_key(key) {
+        Some(field.name().clone())
+    } else {
+        find_in_type(field.data_type(), field.name(), key)
+    }
+}
+
 /// Applies a sequence of schema operations to the given schema, returning a
 /// [`SchemaEvolutionResult`] (see the struct's docs for details).
 ///
@@ -172,6 +204,20 @@ pub(crate) fn apply_schema_operations(
                         field.name()
                     )));
                 }
+                for (key, reason) in [
+                    ("EXISTS_DEFAULT", "Spark's internal existing-default marker"),
+                    ("delta.typeChanges", "physical type-change history"),
+                    (
+                        "delta.isInternalColumn",
+                        "a Delta Kernel internal-column marker",
+                    ),
+                ] {
+                    if let Some(path) = find_field_metadata_path(&field, key) {
+                        return Err(Error::unsupported(format!(
+                            "Cannot add column '{path}' with `{key}` metadata: an additive schema-evolution operation cannot introduce {reason}"
+                        )));
+                    }
+                }
                 let field = if cm_enabled {
                     let id = max_id.as_mut().ok_or_else(|| {
                         Error::invalid_protocol(
@@ -184,9 +230,9 @@ pub(crate) fn apply_schema_operations(
                     // <https://github.com/delta-io/delta-kernel-rs/issues/2492>
                     try_assign_flat_column_mapping_info(&field, id)?
                 } else {
-                    // No upfront reject for stray CM metadata here: the AlterTable builder's
-                    // validate_schema_column_mapping rejects any CM annotation over the evolved
-                    // schema.
+                    // Stray CM metadata on a mapping-disabled table is handled by the AlterTable
+                    // builder, which strips annotations this ALTER newly introduces from the
+                    // evolved schema.
                     field
                 };
                 schema.field_map_mut().insert(field.name().clone(), field);
@@ -239,15 +285,23 @@ pub(crate) fn evolve_table_configuration(
             "ALTER TABLE is not yet supported on tables with icebergCompatV3 enabled",
         ));
     }
+    // TODO(#2630): Support schema evolution on tables with column defaults.
+    if table_config.is_feature_enabled(&TableFeature::AllowColumnDefaults) {
+        return Err(Error::unsupported(
+            "ALTER TABLE is not yet supported on tables with allowColumnDefaults enabled",
+        ));
+    }
     // Rejects writes to tables kernel can't safely commit to: writer version out of
     // kernel's supported range, unsupported writer features, or schemas with SQL-expression
-    // invariants. Runs on the pre-evolution configuration; future schema operations that change
-    // the protocol must also re-check this on the evolved `TableConfiguration`.
+    // invariants. The evolved configuration is checked again below after schema-dependent
+    // protocol requirements have been validated.
     table_config.ensure_operation_supported(Operation::Write)?;
 
     let schema = Arc::unwrap_or_clone(table_config.logical_schema());
     let column_mapping_mode = table_config.column_mapping_mode();
     let current_max_column_id = table_config.table_properties().column_mapping_max_column_id;
+    let current_has_column_mapping_metadata = column_mapping_mode == ColumnMappingMode::None
+        && schema_has_column_mapping_metadata(&schema);
     let SchemaEvolutionResult {
         schema: evolved_schema,
         new_max_column_id,
@@ -258,7 +312,12 @@ pub(crate) fn evolve_table_configuration(
         current_max_column_id,
     )?;
 
-    validate_schema_column_mapping_strict(&evolved_schema, column_mapping_mode)?;
+    let evolved_schema = if column_mapping_mode == ColumnMappingMode::None {
+        strip_stray_column_mapping_metadata(current_has_column_mapping_metadata, &evolved_schema)
+            .map_or(evolved_schema, Arc::new)
+    } else {
+        evolved_schema
+    };
     let evolved_metadata = table_config
         .metadata()
         .clone()
@@ -267,7 +326,10 @@ pub(crate) fn evolve_table_configuration(
             metadata.with_configuration_entry(COLUMN_MAPPING_MAX_COLUMN_ID, id.to_string())
         });
 
-    TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)
+    let evolved =
+        TableConfiguration::try_new_with_schema(table_config, evolved_metadata, evolved_schema)?;
+    evolved.ensure_operation_supported(Operation::Write)?;
+    Ok(evolved)
 }
 
 #[cfg(test)]
@@ -284,11 +346,10 @@ mod tests {
     };
 
     fn simple_schema() -> StructType {
-        StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable("name", DataType::STRING),
-        ])
-        .unwrap()
+        schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        }
     }
 
     fn add_col(name: &str, nullable: bool) -> SchemaOperation {
@@ -304,26 +365,19 @@ mod tests {
     // `validate_schema` (not just the top-level dup check or `StructType::try_new`) is
     // reached from `apply_schema_operations`.
     fn add_struct_with_nested_leaf(name: &str, leaf_name: &str) -> SchemaOperation {
-        let inner =
-            StructType::try_new(vec![StructField::nullable(leaf_name, DataType::STRING)]).unwrap();
         SchemaOperation::AddColumn {
-            field: StructField::nullable(name, inner),
+            field: StructField::nullable(name, schema! { nullable (leaf_name): STRING }),
         }
     }
 
     fn nested_schema() -> StructType {
-        StructType::try_new(vec![
-            StructField::not_null("id", DataType::INTEGER),
-            StructField::nullable(
-                "address",
-                StructType::try_new(vec![
-                    StructField::not_null("city", DataType::STRING),
-                    StructField::nullable("zip", DataType::STRING),
-                ])
-                .unwrap(),
-            ),
-        ])
-        .unwrap()
+        schema! {
+            not_null "id": INTEGER,
+            nullable "address": {
+                not_null "city": STRING,
+                nullable "zip": STRING,
+            },
+        }
     }
 
     // === modify_field_at_path tests ===
@@ -440,6 +494,58 @@ mod tests {
         assert!(err.to_string().contains(error_contains));
     }
 
+    #[test]
+    fn add_column_preserves_nested_current_default_metadata() {
+        let nested = StructField::nullable("code", DataType::STRING).add_metadata([(
+            ColumnMetadataKey::CurrentDefault.as_ref(),
+            MetadataValue::String("'unknown'".to_owned()),
+        )]);
+        let field = StructField::nullable(
+            "payload",
+            StructType::try_new([nested]).expect("nested schema is valid"),
+        );
+
+        let result = apply_schema_operations(
+            simple_schema(),
+            vec![SchemaOperation::AddColumn { field }],
+            ColumnMappingMode::None,
+            None,
+        )
+        .expect("orphan current-default metadata is inert without the table feature");
+
+        assert_eq!(
+            result
+                .schema
+                .field_at_path(&column_name!("payload", "code"))
+                .get_config_value(&ColumnMetadataKey::CurrentDefault),
+            Some(&MetadataValue::String("'unknown'".to_owned()))
+        );
+    }
+
+    #[rstest]
+    #[case::exists_default("EXISTS_DEFAULT")]
+    #[case::type_changes("delta.typeChanges")]
+    #[case::internal_column("delta.isInternalColumn")]
+    fn add_column_rejects_internal_or_historical_metadata(#[case] key: &str) {
+        let nested = StructField::nullable("code", DataType::STRING)
+            .add_metadata([(key, MetadataValue::String("forged".to_owned()))]);
+        let field = StructField::nullable(
+            "payload",
+            StructType::try_new([nested]).expect("nested schema is valid"),
+        );
+
+        let error = apply_schema_operations(
+            simple_schema(),
+            vec![SchemaOperation::AddColumn { field }],
+            ColumnMappingMode::None,
+            None,
+        )
+        .expect_err("ADD COLUMN cannot introduce internal or historical metadata");
+
+        assert!(error.to_string().contains("payload.code"));
+        assert!(error.to_string().contains(key));
+    }
+
     #[rstest]
     #[case::single(vec![add_col("email", true)], &["id", "name", "email"])]
     #[case::multiple(
@@ -501,11 +607,11 @@ mod tests {
     /// `set_nullable_succeeds` rstest because it asserts on inner-field preservation.
     #[test]
     fn set_nullable_on_struct_itself_preserves_inner_fields() {
-        let schema = StructType::try_new(vec![StructField::not_null(
-            "address",
-            StructType::try_new(vec![StructField::not_null("city", DataType::STRING)]).unwrap(),
-        )])
-        .unwrap();
+        let schema = schema! {
+            not_null "address": {
+                not_null "city": STRING,
+            },
+        };
         let ops = vec![SchemaOperation::SetNullable {
             column: column_name!("address"),
         }];
@@ -542,16 +648,13 @@ mod tests {
     fn set_nullable_nested_preserves_top_level_order() {
         // SetNullable on a nested field within a middle top-level field must not reorder
         // the top-level IndexMap.
-        let schema = StructType::try_new(vec![
-            StructField::not_null("alpha", DataType::INTEGER),
-            StructField::nullable(
-                "beta",
-                StructType::try_new(vec![StructField::not_null("nested", DataType::STRING)])
-                    .unwrap(),
-            ),
-            StructField::not_null("gamma", DataType::STRING),
-        ])
-        .unwrap();
+        let schema = schema! {
+            not_null "alpha": INTEGER,
+            nullable "beta": {
+                not_null "nested": STRING,
+            },
+            not_null "gamma": STRING,
+        };
         let ops = vec![SchemaOperation::SetNullable {
             column: column_name!("beta.nested"),
         }];
@@ -647,13 +750,10 @@ mod tests {
     }
 
     fn struct_of_two_primitives() -> DataType {
-        DataType::from(
-            StructType::try_new(vec![
-                StructField::nullable("a", DataType::STRING),
-                StructField::nullable("b", DataType::STRING),
-            ])
-            .unwrap(),
-        )
+        DataType::from(schema! {
+            nullable "a": STRING,
+            nullable "b": STRING,
+        })
     }
 
     /// Adding a complex column on a CM table: every inner struct field reachable through
@@ -719,7 +819,9 @@ mod tests {
     #[case::top_level(field_with_id_only("tainted", DataType::STRING, 99))]
     #[case::nested_in_struct(StructField::nullable(
         "outer",
-        StructType::try_new(vec![field_with_id_only("inner", DataType::STRING, 99)]).unwrap(),
+        schema! {
+            (field_with_id_only("inner", DataType::STRING, 99)),
+        },
     ))]
     fn add_column_with_preexisting_cm_metadata_is_preserved_under_cm(#[case] field: StructField) {
         let ops = vec![SchemaOperation::AddColumn { field }];
@@ -819,7 +921,9 @@ mod tests {
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
             MetadataValue::Number(42),
         );
-        let schema = StructType::try_new(vec![existing]).unwrap();
+        let schema = schema! {
+            (existing),
+        };
         let ops = vec![SchemaOperation::AddColumn {
             field: StructField::nullable("new", DataType::STRING),
         }];

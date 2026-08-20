@@ -20,12 +20,14 @@ use crate::DeltaResult;
 /// For each required column, validates that `nullCount` is present (non-null) and that
 /// `minValues` and `maxValues` are present unless the column is all-null
 /// (`nullCount == numRecords`).
+#[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
 pub struct StatsColumnVerifier {
     required_columns: Vec<(ColumnName, DataType)>,
 }
 
 impl StatsColumnVerifier {
     /// Create a new verifier that checks statistics for the given required columns and types.
+    #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
     pub fn new(required_columns: Vec<(ColumnName, DataType)>) -> Self {
         Self { required_columns }
     }
@@ -34,6 +36,7 @@ impl StatsColumnVerifier {
     ///
     /// For each required column, extracts all three stat columns (nullCount, minValues,
     /// maxValues) in a single `visit_rows` call per batch.
+    #[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
     pub fn verify(&self, add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
         if self.required_columns.is_empty() {
             return Ok(());
@@ -55,8 +58,8 @@ impl StatsColumnVerifier {
         data_type: &DataType,
     ) -> DeltaResult<()> {
         let column_names = vec![
-            ColumnName::new(["path"]),
-            ColumnName::new(["stats", NUM_RECORDS]),
+            column_name!("path"),
+            column_name!("stats", NUM_RECORDS),
             build_stat_path(column, NULL_COUNT),
             build_stat_path(column, MIN_VALUES),
             build_stat_path(column, MAX_VALUES),
@@ -190,6 +193,10 @@ fn column_types_for(dt: &DataType) -> DeltaResult<&'static ColumnNamesAndTypes> 
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => Err(Error::unsupported(
             format!("Interval types are not supported for stats validation: {dt}"),
         )),
+        #[cfg(feature = "geo-type-in-dev")]
+        DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => Err(
+            Error::unsupported(format!("Unsupported data type for stats validation: {dt}")),
+        ),
         &DataType::VOID
         | DataType::Struct(_)
         | DataType::Array(_)
@@ -227,6 +234,12 @@ fn is_stat_present<'b>(
         &DataType::INTERVAL_YEAR_MONTH | &DataType::INTERVAL_DAY_TIME => Err(Error::unsupported(
             format!("Interval types are not supported for stats presence check: {data_type}"),
         )),
+        #[cfg(feature = "geo-type-in-dev")]
+        DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+            Err(Error::unsupported(format!(
+                "Unsupported data type for stats presence check: {data_type}"
+            )))
+        }
         &DataType::VOID
         | DataType::Struct(_)
         | DataType::Array(_)
@@ -287,11 +300,9 @@ impl RowVisitor for ColumnStatsValidator<'_> {
 
 /// Verify that every `add` action has `stats.numRecords` populated. Short-circuits on the first
 /// violation and returns an error containing the `add.path`.
+#[cfg_attr(not(feature = "internal-api"), allow(unreachable_pub))]
 pub fn verify_num_records_present(add_files: &[Box<dyn crate::EngineData>]) -> DeltaResult<()> {
-    let column_names = vec![
-        ColumnName::new(["path"]),
-        ColumnName::new(["stats", NUM_RECORDS]),
-    ];
+    let column_names = vec![column_name!("path"), column_name!("stats", NUM_RECORDS)];
     let mut first_missing: Option<String> = None;
     for batch in add_files {
         let mut visitor = NumRecordsValidator {
@@ -337,5 +348,24 @@ impl RowVisitor for NumRecordsValidator<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "geo-type-in-dev"))]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::schema::{EdgeInterpolationAlgorithm, GeographyType, GeometryType};
+
+    #[rstest]
+    #[case(DataType::Primitive(PrimitiveType::Geometry(Box::new(
+        GeometryType::try_new("EPSG:4326").unwrap()
+    ))))]
+    #[case(DataType::Primitive(PrimitiveType::Geography(Box::new(
+        GeographyType::try_new("EPSG:4326", EdgeInterpolationAlgorithm::Spherical).unwrap()
+    ))))]
+    fn test_geo_types_unsupported_for_stats(#[case] dt: DataType) {
+        assert!(column_types_for(&dt).is_err());
     }
 }

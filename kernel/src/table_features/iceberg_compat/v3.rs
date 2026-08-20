@@ -1,16 +1,13 @@
 //! IcebergCompatV3 checks.
 
-#[cfg(feature = "column-defaults-in-dev")]
 use tracing::warn;
 
 use super::{
     check_no_legacy_nested_ids, check_only_supported_types, IcebergCompatCheck,
     IcebergCompatValidator, IcebergCompatVersion,
 };
-#[cfg(feature = "column-defaults-in-dev")]
-use crate::schema::try_collect_column_defaults;
-use crate::schema::DataType;
 use crate::schema::PrimitiveType::*;
+use crate::schema::{try_collect_column_defaults, DataType};
 use crate::table_configuration::TableConfiguration;
 use crate::DeltaResult;
 
@@ -68,7 +65,6 @@ fn check_v3_supported_types(tc: &TableConfiguration) -> DeltaResult<()> {
 /// # Errors
 ///
 /// Propagates malformed column-default metadata errors from [`try_collect_column_defaults`].
-#[cfg(feature = "column-defaults-in-dev")]
 pub(crate) fn iceberg_compat_v3_column_defaults_validation(
     table_configuration: &TableConfiguration,
 ) -> DeltaResult<()> {
@@ -136,20 +132,17 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "column-defaults-in-dev"))]
+#[cfg(test)]
 mod column_default_tests {
-    use std::collections::HashMap;
-
     use rstest::rstest;
     use test_utils::LoggingTest;
-    use url::Url;
 
     use super::iceberg_compat_v3_column_defaults_validation;
-    use crate::actions::{Metadata, Protocol};
     use crate::schema::ColumnMetadataKey::CurrentDefault;
-    use crate::schema::{ArrayType, DataType, MetadataValue, StructField, StructType};
+    use crate::schema::{schema, ArrayType, DataType, MetadataValue, StructField, StructType};
     use crate::table_configuration::TableConfiguration;
     use crate::table_features::TableFeature;
+    use crate::unit_test_utils::{MockProtocolBuilder, MockTableConfigurationBuilder};
 
     /// Builds a `TableConfiguration` carrying `schema` with `allowColumnDefaults` enabled, so
     /// the IcebergCompatV3 column-default validation can be driven directly. The config does not
@@ -157,22 +150,15 @@ mod column_default_tests {
     /// validation is invoked directly instead, and the end-to-end V3 path is covered by the
     /// integration tests.
     fn table_config_with_schema(schema: StructType) -> TableConfiguration {
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            std::sync::Arc::new(schema),
-            vec![],
-            0,
-            HashMap::new(),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new_modern(
-            TableFeature::EMPTY_LIST,
-            [TableFeature::AllowColumnDefaults],
-        )
-        .unwrap();
-        TableConfiguration::try_new(metadata, protocol, Url::parse("file:///t/").unwrap(), 0)
-            .unwrap()
+        MockTableConfigurationBuilder::new()
+            .with_schema(schema)
+            .with_protocol(
+                MockProtocolBuilder::new()
+                    .with_features([TableFeature::AllowColumnDefaults])
+                    .build(),
+            )
+            .with_table_root("file:///t/")
+            .build()
     }
 
     fn field_with_default(
@@ -188,51 +174,50 @@ mod column_default_tests {
 
     #[rstest]
     #[case::primitive_literal(
-        StructType::try_new([field_with_default("a", DataType::INTEGER, "42")]).unwrap(),
+        schema! {
+            (field_with_default("a", DataType::INTEGER, "42")),
+        },
         "a",
         None
     )]
     #[case::primitive_null(
-        StructType::try_new([field_with_default("a", DataType::INTEGER, "NULL")]).unwrap(),
+        schema! {
+            (field_with_default("a", DataType::INTEGER, "NULL")),
+        },
         "a",
         None
     )]
     #[case::non_literal_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            DataType::TIMESTAMP,
-            "current_timestamp()"
-        )]).unwrap(),
+        schema! {
+            (field_with_default("a", DataType::TIMESTAMP, "current_timestamp()")),
+        },
         "a",
         Some("could not verify")
     )]
     #[case::null_on_non_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            ArrayType::new(DataType::INTEGER, true),
-            "NULL"
-        )]).unwrap(),
+        schema! {
+            (field_with_default("a", ArrayType::new(DataType::INTEGER, true), "NULL")),
+        },
         "a",
         None
     )]
     #[case::non_null_on_non_primitive(
-        StructType::try_new([field_with_default(
-            "a",
-            ArrayType::new(DataType::INTEGER, true),
-            "ARRAY(1)"
-        )]).unwrap(),
+        schema! {
+            (field_with_default("a", ArrayType::new(DataType::INTEGER, true), "ARRAY(1)")),
+        },
         "a",
         Some("could not verify")
     )]
     #[case::nested_non_literal(
-        StructType::try_new([StructField::nullable(
-            "s",
-            DataType::try_struct_type([field_with_default(
+        schema! {
+            nullable "s": {
+                (field_with_default(
                 "inner",
                 DataType::TIMESTAMP,
                 "current_timestamp()"
-            )]).unwrap(),
-        )]).unwrap(),
+                )),
+            },
+        },
         "s.inner",
         Some("could not verify")
     )]
